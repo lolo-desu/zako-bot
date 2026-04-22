@@ -90,7 +90,7 @@ export function setPanelAuthCookie(event: H3Event, sessionToken: string) {
     httpOnly: true,
     path: '/',
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: shouldUseSecureCookie(event),
     maxAge: SESSION_MAX_AGE,
   })
 }
@@ -100,8 +100,18 @@ export function clearPanelAuthCookie(event: H3Event) {
     httpOnly: true,
     path: '/',
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: shouldUseSecureCookie(event),
   })
+}
+
+function shouldUseSecureCookie(event: H3Event) {
+  const forwardedProto = event.node.req.headers['x-forwarded-proto']
+
+  if (typeof forwardedProto === 'string' && forwardedProto.trim()) {
+    return forwardedProto.split(',')[0]?.trim() === 'https'
+  }
+
+  return Boolean((event.node.req.socket as { encrypted?: boolean }).encrypted)
 }
 
 function ensureAuthState(): StoredAuthState {

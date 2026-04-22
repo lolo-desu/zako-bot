@@ -350,7 +350,6 @@ export class ApiServer {
     if (!llmModel) throw new Error('Model is required')
     if (!llmApiKey) throw new Error('Model API key is required')
     if (!llmBaseUrl) throw new Error('Model base URL is required')
-    if (!discordUserId) throw new Error('Discord user ID is required')
     if (!discordGuildId) throw new Error('Discord guild ID is required')
 
     return {
