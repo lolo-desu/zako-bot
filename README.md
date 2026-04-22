@@ -91,6 +91,68 @@ zakobot panel
 - 可以访问你要使用的模型服务
 - 如果使用 Discord，需要准备 Bot Token
 
+### 可选：按需浏览器 MCP 前置环境
+
+如果你要使用源码里的 `packages/core/src/mcp/persistent-browser-mcp.ts` 为多个 Bot 提供按需浏览器能力，还需要准备下面这些系统组件：
+
+- `chromium`
+- `Xvfb`
+- `fluxbox`
+- `x11vnc`
+- `websockify`
+- `noVNC` 静态资源目录，默认脚本使用 `/usr/share/novnc/`
+
+这个 MCP 不是默认 CLI 的一部分，它面向源码部署场景，默认启动脚本是：
+
+```text
+scripts/launch-browser-stack.sh
+```
+
+默认配置文件路径是：
+
+```text
+/etc/zako-browser/mcp-profiles.json
+```
+
+每个浏览器实例还需要一个对应的环境文件：
+
+```text
+/etc/zako-browser/<instance>.env
+```
+
+环境文件至少需要提供这些变量：
+
+```bash
+DISPLAY_NUMBER=91
+PROFILE_DIR=/path/to/profile
+RUNTIME_DIR=/path/to/runtime
+VNC_PORT=5901
+VNC_PASSWORD_FILE=/path/to/vncpass
+NOVNC_BIND=0.0.0.0
+NOVNC_PORT=6101
+REMOTE_DEBUGGING_PORT=9221
+START_URL=about:blank
+```
+
+`mcp-profiles.json` 里的每个 profile 需要能对上一个实例名，并提供：
+
+- `id`
+- `label`
+- `instanceName`
+- `cdpUrl`
+- `noVncUrl`
+- `vncPassword`
+
+可选字段包括：
+
+- `launchCommand`
+- `launchArgs`
+- `startTimeoutMs`
+- `idleTimeoutMs`
+- `manualLoginMessage`
+
+这套实现依赖 Chromium 的远程调试端口和持久化 profile 目录：浏览器进程可以按需启动和停止，但登录态保存在 `PROFILE_DIR` 下，方便 Bot 在手动登录后继续复用同一个浏览器环境。
+
 ## 首次使用建议
 
 启动后，建议按这个顺序配置：
