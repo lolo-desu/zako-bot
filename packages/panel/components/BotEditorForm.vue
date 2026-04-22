@@ -114,12 +114,12 @@
       </div>
 
       <div class="grid gap-4 md:grid-cols-2">
-        <UFormField label="用户 ID" name="discordUserId" required>
+        <UFormField label="用户 ID（可选）" name="discordUserId">
           <UInput
             v-model="state.discordUserId"
             class="w-full"
             :disabled="pending"
-            placeholder="输入允许对话的 Discord 用户 ID"
+            placeholder="留空则允许服务器内任意用户对话"
           />
         </UFormField>
 
@@ -307,8 +307,7 @@ const canSubmit = computed(() =>
   && state.llmModel.trim().length > 0
   && state.llmApiKey.trim().length > 0
   && state.llmBaseUrl.trim().length > 0
-  && state.discordUserId.trim().length > 0
-  && state.discordGuildId.trim().length > 0,
+   && state.discordGuildId.trim().length > 0,
 )
 
 function handleSubmit() {
