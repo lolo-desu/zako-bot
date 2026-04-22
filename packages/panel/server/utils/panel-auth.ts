@@ -106,9 +106,12 @@ export function clearPanelAuthCookie(event: H3Event) {
 
 function shouldUseSecureCookie(event: H3Event) {
   const forwardedProto = event.node.req.headers['x-forwarded-proto']
+  const firstForwardedProto = Array.isArray(forwardedProto)
+    ? forwardedProto[0]
+    : forwardedProto
 
-  if (typeof forwardedProto === 'string' && forwardedProto.trim()) {
-    return forwardedProto.split(',')[0]?.trim() === 'https'
+  if (typeof firstForwardedProto === 'string' && firstForwardedProto.trim()) {
+    return firstForwardedProto.split(',')[0]?.trim().toLowerCase() === 'https'
   }
 
   return Boolean((event.node.req.socket as { encrypted?: boolean }).encrypted)
