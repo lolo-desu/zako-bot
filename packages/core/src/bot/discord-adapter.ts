@@ -10,6 +10,7 @@ import type { BotInstanceRow, RoleRow } from '@zakobot/database'
 import type { AgentEvent, GeneralSettings, ToolApprovalCallback } from '@zakobot/shared'
 import type { Agent } from '../llm/agent.js'
 import type { ConversationScope, ConversationService } from '../llm/conversation-service.js'
+import { buildAssistantMessageChunks } from './discord-stream-renderer.js'
 import { DiscordModelCommand, MODEL_COMMAND } from './model-command.js'
 
 const TOOL_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
@@ -115,8 +116,9 @@ export class DiscordAdapter {
   private async handleMessage(msg: Message) {
     if (msg.author.bot) return
 
-    if (this.instance.discordUserId && msg.author.id !== this.instance.discordUserId) return
     if (this.instance.discordGuildId && msg.guildId !== this.instance.discordGuildId) return
+    if (!this.isAllowedDiscordUser(msg.author.id)) return
+    if (!this.isAllowedDiscordChannel(msg.channelId, msg.channel.isThread() ? msg.channel.parentId : null)) return
 
     const isThread = msg.channel.isThread()
     const isMentioned = this.client.user && msg.mentions.has(this.client.user)
@@ -295,15 +297,13 @@ export class DiscordAdapter {
     const { toolApprovalMode, toolProcessMode } = this.getGeneralSettings()
     const logLines: string[] = queuedNotice ? [queuedNotice] : []
     let streamedText = ''
-    let progressMessage: Message | undefined
+    let toolProgressMessage: Message | undefined
     let pendingApprovalMessage: { content: string; components: ActionRowBuilder<ButtonBuilder>[] } | undefined
+    const assistantMessages: { message: Message; content: string }[] = []
 
-    const renderContent = () => {
-      const sections = [
-        ...logLines,
-        pendingApprovalMessage?.content,
-        streamedText.trim() ? streamedText : undefined,
-      ].filter((section): section is string => Boolean(section && section.trim()))
+    const renderToolContent = () => {
+      const sections = [...logLines, pendingApprovalMessage?.content]
+        .filter((section): section is string => Boolean(section && section.trim()))
 
       const content = sections.join('\n\n').trim() || '（处理中...）'
       if (content.length <= MAX_DISCORD_MESSAGE_CHARS) {
@@ -314,23 +314,47 @@ export class DiscordAdapter {
       return `${prefix}${content.slice(-(MAX_DISCORD_MESSAGE_CHARS - prefix.length))}`
     }
 
-    const commit = async () => {
-      const content = renderContent()
+    const commitToolMessage = async () => {
+      if (!logLines.length && !pendingApprovalMessage && !toolProgressMessage) {
+        return undefined
+      }
+
+      const content = renderToolContent()
       const components = pendingApprovalMessage?.components ?? []
 
-      if (!progressMessage) {
-        progressMessage = await createMessage({ content, components })
-        return progressMessage
+      if (!toolProgressMessage) {
+        toolProgressMessage = await createMessage({ content, components })
+        return toolProgressMessage
       }
 
       const payload: MessageEditOptions = { content, components }
-      progressMessage = await progressMessage.edit(payload)
-      return progressMessage
+      toolProgressMessage = await toolProgressMessage.edit(payload)
+      return toolProgressMessage
     }
 
     const pushLog = async (line: string) => {
       logLines.push(line)
-      await commit()
+      await commitToolMessage()
+    }
+
+    const syncAssistantMessages = async () => {
+      const chunks = buildAssistantMessageChunks(streamedText, MAX_DISCORD_MESSAGE_CHARS)
+
+      for (const [index, chunk] of chunks.entries()) {
+        const existing = assistantMessages[index]
+        if (!existing) {
+          const message = await createMessage({ content: chunk })
+          assistantMessages.push({ message, content: chunk })
+          continue
+        }
+
+        if (existing.content === chunk) {
+          continue
+        }
+
+        existing.message = await existing.message.edit({ content: chunk })
+        existing.content = chunk
+      }
     }
 
     let requestApproval: ToolApprovalCallback | undefined
@@ -359,7 +383,10 @@ export class DiscordAdapter {
         )
 
         pendingApprovalMessage = { content, components: [row] }
-        const approvalMsg = await commit()
+        const approvalMsg = await commitToolMessage()
+        if (!approvalMsg) {
+          throw new Error('Failed to create tool approval message')
+        }
 
         return new Promise<boolean>((resolve, reject) => {
           const finish = (value: boolean) => {
@@ -372,7 +399,7 @@ export class DiscordAdapter {
             pendingApprovalMessage = undefined
             logLines.push(`${content.replace(/^🔧 \*\*/, '⏰ **')}\n— 超时已自动拒绝`)
             finish(false)
-            void approvalMsg.edit({ content: renderContent(), components: [] }).catch(() => {})
+            void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }, TOOL_APPROVAL_TIMEOUT_MS)
 
           const onAbort = () => {
@@ -381,7 +408,7 @@ export class DiscordAdapter {
             pendingApprovalMessage = undefined
             logLines.push(`${content.replace(/^🔧 \*\*/, '⏹️ **')}\n— 已通过 /stop 停止`)
             reject(new Error(REQUEST_STOPPED_MESSAGE))
-            void approvalMsg.edit({ content: renderContent(), components: [] }).catch(() => {})
+            void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }
 
           abortSignal?.addEventListener('abort', onAbort, { once: true })
@@ -395,7 +422,7 @@ export class DiscordAdapter {
                 content.replace(/^🔧 \*\*/, approved ? '✅ **' : '❌ **')
                 + (approved ? '\n— 已允许' : '\n— 已拒绝'),
               )
-              await interaction.update({ content: renderContent(), components: [] }).catch(() => {})
+              await interaction.update({ content: renderToolContent(), components: [] }).catch(() => {})
               finish(approved)
             },
           })
@@ -420,7 +447,7 @@ export class DiscordAdapter {
           if (event.content) {
             this.throwIfStopped(abortSignal)
             streamedText += event.content
-            await commit()
+            await syncAssistantMessages()
           }
           break
         case 'tool_call': {
@@ -443,15 +470,15 @@ export class DiscordAdapter {
         case 'done':
           fullContent = event.content
           streamedText = event.content
-          await commit()
+          await syncAssistantMessages()
           break
       }
     }
 
-    if (!progressMessage) {
+    if (!assistantMessages.length) {
       this.throwIfStopped(abortSignal)
       streamedText = fullContent || '（无回复）'
-      await commit()
+      await syncAssistantMessages()
     }
 
     return fullContent
@@ -523,6 +550,28 @@ export class DiscordAdapter {
     }
   }
 
+  private isAllowedDiscordUser(userId: string) {
+    const allowedUserIds = this.parseDiscordIdList(this.instance.discordUserId)
+    return allowedUserIds.length === 0 || allowedUserIds.includes(userId)
+  }
+
+  private isAllowedDiscordChannel(channelId: string, parentChannelId: string | null) {
+    const allowedChannelIds = this.parseDiscordIdList(this.instance.discordChannelId)
+    if (allowedChannelIds.length === 0) {
+      return true
+    }
+
+    return allowedChannelIds.includes(channelId)
+      || (!!parentChannelId && allowedChannelIds.includes(parentChannelId))
+  }
+
+  private parseDiscordIdList(value: string) {
+    return value
+      .split(/[\s,]+/)
+      .map(item => item.trim())
+      .filter(Boolean)
+  }
+
   private async handleInteraction(interaction: import('discord.js').Interaction) {
     if (interaction.isButton()) {
       const [action, callId] = interaction.customId.split(':')
@@ -542,9 +591,9 @@ export class DiscordAdapter {
     if (!interaction.isChatInputCommand()) return
 
     try {
-      if (this.instance.discordUserId && interaction.user.id !== this.instance.discordUserId) {
+      if (!this.isAllowedDiscordUser(interaction.user.id)) {
         await interaction.reply({
-          content: '只有已配置的 Discord 用户可以使用此命令。',
+          content: '你不在此机器人的允许用户列表中。',
           ephemeral: true,
         })
         return
@@ -553,6 +602,15 @@ export class DiscordAdapter {
       if (this.instance.discordGuildId && interaction.guildId !== this.instance.discordGuildId) {
         await interaction.reply({
           content: '此命令只能在已配置的 Discord 服务器中使用。',
+          ephemeral: true,
+        })
+        return
+      }
+
+      const parentChannelId = interaction.channel?.isThread() ? interaction.channel.parentId : null
+      if (!this.isAllowedDiscordChannel(interaction.channelId, parentChannelId)) {
+        await interaction.reply({
+          content: '此命令只能在已配置的频道或其子区中使用。',
           ephemeral: true,
         })
         return

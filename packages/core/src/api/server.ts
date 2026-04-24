@@ -197,6 +197,7 @@ export class ApiServer {
       llmApiKey: row.instance.llmApiKey,
       llmBaseUrl: row.instance.llmBaseUrl,
       discordUserId: row.instance.discordUserId,
+      discordChannelId: row.instance.discordChannelId,
       discordGuildId: row.instance.discordGuildId,
       enabled: row.instance.enabled,
       createdAt: row.instance.createdAt.toISOString(),
@@ -215,6 +216,7 @@ export class ApiServer {
       llmPlatformName: row.instance.llmPlatformName,
       llmModel: row.instance.llmModel,
       discordUserId: row.instance.discordUserId,
+      discordChannelId: row.instance.discordChannelId,
       discordGuildId: row.instance.discordGuildId,
       enabled: row.instance.enabled,
       createdAt: row.instance.createdAt.toISOString(),
@@ -338,6 +340,7 @@ export class ApiServer {
     const llmApiKey = body.llmApiKey?.trim()
     const llmBaseUrl = body.llmBaseUrl?.trim()
     const discordUserId = body.discordUserId?.trim()
+    const discordChannelId = body.discordChannelId?.trim()
     const discordGuildId = body.discordGuildId?.trim()
     const platform = body.platform?.trim()
 
@@ -363,6 +366,7 @@ export class ApiServer {
       llmApiKey,
       llmBaseUrl,
       discordUserId,
+      discordChannelId,
       discordGuildId,
       enabled: Boolean(body.enabled),
     }
@@ -978,6 +982,7 @@ export class ApiServer {
           llmApiKey: payload.llmApiKey,
           llmBaseUrl: payload.llmBaseUrl,
           discordUserId: payload.discordUserId,
+          discordChannelId: payload.discordChannelId,
           discordGuildId: payload.discordGuildId,
           enabled: payload.enabled,
           createdAt: now,
@@ -1143,6 +1148,7 @@ export class ApiServer {
           llmApiKey: payload.llmApiKey,
           llmBaseUrl: payload.llmBaseUrl,
           discordUserId: payload.discordUserId,
+          discordChannelId: payload.discordChannelId,
           discordGuildId: payload.discordGuildId,
           enabled: payload.enabled,
           updatedAt: new Date(),

@@ -40,6 +40,7 @@ const form: BotEditorInput = {
   llmApiKey: '',
   llmBaseUrl: '',
   discordUserId: '',
+  discordChannelId: '',
   discordGuildId: '',
   enabled: true,
 }

@@ -114,12 +114,21 @@
       </div>
 
       <div class="grid gap-4 md:grid-cols-2">
-        <UFormField label="用户 ID（可选）" name="discordUserId">
+        <UFormField label="用户 ID 白名单（可选）" name="discordUserId">
           <UInput
             v-model="state.discordUserId"
             class="w-full"
             :disabled="pending"
-            placeholder="留空则允许服务器内任意用户对话"
+            placeholder="多个用户可用逗号或空格分隔；留空则允许服务器内任意用户对话"
+          />
+        </UFormField>
+
+        <UFormField label="频道 ID 白名单（可选）" name="discordChannelId">
+          <UInput
+            v-model="state.discordChannelId"
+            class="w-full"
+            :disabled="pending"
+            placeholder="多个频道可用逗号或空格分隔；子区会继承父频道白名单"
           />
         </UFormField>
 
@@ -200,6 +209,7 @@ const state = reactive<BotEditorInput>({
   llmApiKey: '',
   llmBaseUrl: '',
   discordUserId: '',
+  discordChannelId: '',
   discordGuildId: '',
   enabled: true,
 })
@@ -269,6 +279,7 @@ watch(
     state.llmApiKey = value.llmApiKey
     state.llmBaseUrl = value.llmBaseUrl
     state.discordUserId = value.discordUserId
+    state.discordChannelId = value.discordChannelId
     state.discordGuildId = value.discordGuildId
     state.enabled = value.enabled
     selectedModelValue.value = resolveModelValue(value.llmPlatformName, value.llmModel)
@@ -326,6 +337,7 @@ function handleSubmit() {
     llmApiKey: state.llmApiKey.trim(),
     llmBaseUrl: state.llmBaseUrl.trim(),
     discordUserId: state.discordUserId.trim(),
+    discordChannelId: state.discordChannelId.trim(),
     discordGuildId: state.discordGuildId.trim(),
     enabled: state.enabled,
   })

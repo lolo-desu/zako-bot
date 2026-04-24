@@ -90,6 +90,7 @@ const form = computed<BotEditorInput>(() => ({
   llmApiKey: bot.value?.llmApiKey ?? '',
   llmBaseUrl: bot.value?.llmBaseUrl ?? '',
   discordUserId: bot.value?.discordUserId ?? '',
+  discordChannelId: bot.value?.discordChannelId ?? '',
   discordGuildId: bot.value?.discordGuildId ?? '',
   enabled: bot.value?.enabled ?? true,
 }))

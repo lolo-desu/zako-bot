@@ -11,6 +11,7 @@ export interface BotEditorInput {
   llmApiKey: string
   llmBaseUrl: string
   discordUserId: string
+  discordChannelId: string
   discordGuildId: string
   enabled: boolean
 }
@@ -33,6 +34,7 @@ export interface BotListItem {
   llmPlatformName: string
   llmModel: string
   discordUserId: string
+  discordChannelId: string
   discordGuildId: string
   enabled: boolean
   createdAt: string

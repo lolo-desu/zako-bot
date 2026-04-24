@@ -12,6 +12,7 @@ export const botInstances = sqliteTable('bot_instances', {
   llmApiKey: text('llm_api_key').notNull().default(''),
   llmBaseUrl: text('llm_base_url').notNull().default(''),
   discordUserId: text('discord_user_id').notNull().default(''),
+  discordChannelId: text('discord_channel_id').notNull().default(''),
   discordGuildId: text('discord_guild_id').notNull().default(''),
   roleId: text('role_id')
     .notNull()
