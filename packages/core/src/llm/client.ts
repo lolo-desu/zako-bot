@@ -167,13 +167,19 @@ export class LLMClient {
       const message = response.choices[0]?.message
       if (!message) throw new Error('LLM returned empty response')
 
-      if (message.content) {
+      const toolCalls = message.tool_calls ?? []
+      const hasToolCalls = toolCalls.length > 0
+
+      // Some providers leak internal tool markup into assistant content while also
+      // returning structured tool_calls. Keep that content out of the user-facing
+      // stream and wait for the final post-tool answer instead.
+      if (message.content && !hasToolCalls) {
         for (const segment of this.splitSegments(message.content)) {
           yield { type: 'text_chunk', content: segment }
         }
       }
 
-      if (!message.tool_calls?.length) {
+      if (!hasToolCalls) {
         yield { type: 'done', content: message.content ?? '' }
         return
       }
@@ -181,7 +187,7 @@ export class LLMClient {
       requestMessages.push(this.toAssistantToolCallMessage(message))
 
       const toolResultMessages: OpenAI.Chat.ChatCompletionMessageParam[] = []
-      for (const toolCall of message.tool_calls) {
+      for (const toolCall of toolCalls) {
         if (toolCall.type !== 'function') continue
 
         const tool = tools.find(t => t.name === toolCall.function.name)
@@ -229,7 +235,7 @@ export class LLMClient {
       requestMessages.push(...toolResultMessages)
     }
 
-    console.warn(`[LLM] Reached tool-call limit (${MAX_TOOL_CALL_ROUNDS}); requesting final answer without tools.`)
+    console.warn(`[LLM] Reached tool-call limit (${maxToolCallRounds}); requesting final answer without tools.`)
     const finalResponse = await this.requestWithRetry(() => this.openai!.chat.completions.create({
       model: this.config.model,
       messages: [

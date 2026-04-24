@@ -457,12 +457,12 @@ export class DiscordAdapter {
             && !(toolApprovalMode === 'sensitive' && !this.agent.isToolSensitive(event.name))
           if (!approvalWillShow) {
             this.throwIfStopped(abortSignal)
-            await pushLog(`🔧 **调用工具：${event.name}**`)
+            await pushLog(`🔧 调用工具：${event.name}`)
           }
           break
         }
         case 'tool_result':
-          if (toolProcessMode === 'full') {
+          if (toolProcessMode === 'full' && !event.ok) {
             this.throwIfStopped(abortSignal)
             await pushLog(this.formatToolResult(event))
           }
@@ -520,16 +520,9 @@ export class DiscordAdapter {
   }
 
   private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>): string {
-    if (!event.ok) {
-      return event.result === 'User denied this tool call.'
-        ? `❌ **${event.name}** — 已拒绝`
-        : `⚠️ **${event.name}** — ${event.result.slice(0, 300)}`
-    }
-    if (!event.result.trim()) return `✅ **${event.name}** — 完成`
-    const display = event.result.length > 800
-      ? `${event.result.slice(0, 800)}\n...（共 ${event.result.length} 字符）`
-      : event.result
-    return `✅ **${event.name}**\n\`\`\`\n${display}\n\`\`\``
+    return event.result === 'User denied this tool call.'
+      ? `❌ 工具已拒绝：${event.name}`
+      : `⚠️ 工具执行失败：${event.name}`
   }
 
   private getUserFacingErrorMessage(error: unknown) {
