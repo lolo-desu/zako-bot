@@ -3,7 +3,7 @@ import type { DB } from '@zakobot/database'
 import type { GeneralSettings, ToolApprovalMode, ToolProcessMode } from '@zakobot/shared'
 
 const GENERAL_SETTINGS_KEY = 'general'
-const DEFAULT_MAX_TOOL_CALL_ROUNDS = 8
+const DEFAULT_MAX_TOOL_CALL_ROUNDS = 32
 
 export function getGeneralSettings(db: DB): GeneralSettings {
   const row = getAppSetting(db, GENERAL_SETTINGS_KEY)

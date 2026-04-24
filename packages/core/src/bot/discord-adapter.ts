@@ -304,8 +304,9 @@ export class DiscordAdapter {
     const renderToolContent = () => {
       const sections = [...logLines, pendingApprovalMessage?.content]
         .filter((section): section is string => Boolean(section && section.trim()))
+        .map(section => section.trim())
 
-      const content = sections.join('\n\n').trim() || '（处理中...）'
+      const content = sections.join('\n').trim() || '（处理中...）'
       if (content.length <= MAX_DISCORD_MESSAGE_CHARS) {
         return content
       }
@@ -367,9 +368,7 @@ export class DiscordAdapter {
           return true
         }
 
-        const inputStr = JSON.stringify(input, null, 2)
-        const display = inputStr.length > 800 ? `${inputStr.slice(0, 800)}\n...` : inputStr
-        const content = `🔧 **调用工具：${name}**\n\`\`\`json\n${display}\n\`\`\``
+        const content = `🔧 等待工具授权：${name} ${this.formatToolPayload(input, 240)}`.trim()
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder()
@@ -397,7 +396,7 @@ export class DiscordAdapter {
           const timer = setTimeout(() => {
             this.pendingApprovals.delete(callId)
             pendingApprovalMessage = undefined
-            logLines.push(`${content.replace(/^🔧 \*\*/, '⏰ **')}\n— 超时已自动拒绝`)
+            logLines.push(`⏰ 工具授权超时：${name}`)
             finish(false)
             void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }, TOOL_APPROVAL_TIMEOUT_MS)
@@ -406,7 +405,7 @@ export class DiscordAdapter {
             clearTimeout(timer)
             this.pendingApprovals.delete(callId)
             pendingApprovalMessage = undefined
-            logLines.push(`${content.replace(/^🔧 \*\*/, '⏹️ **')}\n— 已通过 /stop 停止`)
+            logLines.push(`⏹️ 工具授权已停止：${name}`)
             reject(new Error(REQUEST_STOPPED_MESSAGE))
             void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }
@@ -418,10 +417,7 @@ export class DiscordAdapter {
               clearTimeout(timer)
               this.pendingApprovals.delete(callId)
               pendingApprovalMessage = undefined
-              logLines.push(
-                content.replace(/^🔧 \*\*/, approved ? '✅ **' : '❌ **')
-                + (approved ? '\n— 已允许' : '\n— 已拒绝'),
-              )
+              logLines.push(approved ? `✅ 已允许工具：${name}` : `❌ 已拒绝工具：${name}`)
               await interaction.update({ content: renderToolContent(), components: [] }).catch(() => {})
               finish(approved)
             },
@@ -457,15 +453,20 @@ export class DiscordAdapter {
             && !(toolApprovalMode === 'sensitive' && !this.agent.isToolSensitive(event.name))
           if (!approvalWillShow) {
             this.throwIfStopped(abortSignal)
-            await pushLog(`🔧 调用工具：${event.name}`)
+            await pushLog(this.formatToolCall(event.name, event.input))
           }
           break
         }
         case 'tool_result':
-          if (toolProcessMode === 'full' && !event.ok) {
+          if (toolProcessMode === 'full') {
             this.throwIfStopped(abortSignal)
             await pushLog(this.formatToolResult(event))
           }
+          break
+        case 'tool_limit_reached':
+          this.throwIfStopped(abortSignal)
+          console.warn(`[Discord] Tool-call limit reached for "${this.instance.name}" topic=${topicId} limit=${event.limit}`)
+          await pushLog(`⚠️ 已达到工具调用上限（${event.limit} 次），模型现在会停止继续调用工具，并基于已有信息直接给出回复。`)
           break
         case 'done':
           fullContent = event.content
@@ -520,9 +521,44 @@ export class DiscordAdapter {
   }
 
   private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>): string {
+    if (event.ok) {
+      return `✅ 工具完成：${event.name} -> ${this.formatToolPayload(event.result, 220)}`
+    }
+
     return event.result === 'User denied this tool call.'
       ? `❌ 工具已拒绝：${event.name}`
-      : `⚠️ 工具执行失败：${event.name}`
+      : `⚠️ 工具执行失败：${event.name} -> ${this.formatToolPayload(event.result, 220)}`
+  }
+
+  private formatToolCall(name: string, input: unknown): string {
+    const payload = this.formatToolPayload(input, 220)
+    return payload ? `🔧 调用工具：${name} ${payload}` : `🔧 调用工具：${name}`
+  }
+
+  private formatToolPayload(value: unknown, maxLength: number): string {
+    const raw = typeof value === 'string'
+      ? value
+      : this.safeJsonStringify(value)
+
+    if (!raw) {
+      return ''
+    }
+
+    const compact = raw.replace(/\s+/g, ' ').trim()
+    if (!compact) {
+      return ''
+    }
+
+    return compact.length <= maxLength ? compact : `${compact.slice(0, maxLength - 3)}...`
+  }
+
+  private safeJsonStringify(value: unknown): string {
+    try {
+      return JSON.stringify(value)
+    }
+    catch {
+      return String(value)
+    }
   }
 
   private getUserFacingErrorMessage(error: unknown) {
@@ -821,14 +857,52 @@ export class DiscordAdapter {
     sendTyping: () => Promise<unknown>,
   ) {
     this.conversations.appendMessage(this.instance, topicId, scope, input)
-    await sendTyping()
-    const fullReply = await this.enqueueTopicReply(topicId, scope.scopeKey, createMessage)
+    const fullReply = await this.withTypingIndicator(
+      sendTyping,
+      () => this.enqueueTopicReply(topicId, scope.scopeKey, createMessage),
+    )
     this.conversations.appendMessage(this.instance, topicId, scope, {
       role: 'assistant',
       content: fullReply,
       senderId: this.client.user?.id ?? '',
       senderName: this.client.user?.username ?? this.instance.name,
     })
+  }
+
+  private async withTypingIndicator<T>(
+    sendTyping: () => Promise<unknown>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const refreshTyping = async () => {
+      if (stopped) return
+
+      try {
+        await sendTyping()
+      }
+      catch {
+        // Ignore typing indicator failures so the actual reply can continue.
+      }
+
+      if (stopped) return
+      timer = setTimeout(() => {
+        void refreshTyping()
+      }, 8000)
+    }
+
+    await refreshTyping()
+
+    try {
+      return await run()
+    }
+    finally {
+      stopped = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+    }
   }
 
   private async createThreadTopicFromMessage(msg: Message, userText: string) {

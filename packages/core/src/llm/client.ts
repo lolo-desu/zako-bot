@@ -236,6 +236,7 @@ export class LLMClient {
     }
 
     console.warn(`[LLM] Reached tool-call limit (${maxToolCallRounds}); requesting final answer without tools.`)
+    yield { type: 'tool_limit_reached', limit: maxToolCallRounds }
     const finalResponse = await this.requestWithRetry(() => this.openai!.chat.completions.create({
       model: this.config.model,
       messages: [
@@ -399,6 +400,7 @@ export class LLMClient {
     }
 
     console.warn(`[LLM] Reached tool-call limit (${maxToolCallRounds}); requesting final answer without tools.`)
+    yield { type: 'tool_limit_reached', limit: maxToolCallRounds }
     const final = await this.requestWithRetry(() => this.genai!.models.generateContent({
       model: this.config.model,
       contents,

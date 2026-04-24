@@ -11,10 +11,14 @@ import { getSearchSettings } from './settings/search-settings.js'
 import { getBrowseSettings } from './settings/browse-settings.js'
 import { getGeneralSettings } from './settings/general-settings.js'
 import { ensureDirectory, getMcpWorkdir, getSkillsRoot, getZakobotHome, resolveZakobotPath } from './runtime/paths.js'
+import { initFileConsoleLogging } from './runtime/logger.js'
 
 const zakobotHome = ensureDirectory(getZakobotHome())
 const mcpWorkdir = ensureDirectory(getMcpWorkdir(zakobotHome))
 const skillsRoot = ensureDirectory(getSkillsRoot(zakobotHome))
+const logsDir = ensureDirectory(resolveZakobotPath(zakobotHome, 'logs'))
+
+initFileConsoleLogging(resolveZakobotPath(logsDir, 'core.log'))
 
 const dbUrl = process.env.DATABASE_URL ?? resolveZakobotPath(zakobotHome, 'data.db')
 const db = createDb(dbUrl)
