@@ -6,11 +6,12 @@ import type {
   BotInstanceRow,
   RoleRow,
 } from '@zakobot/database'
-import { getEnabledBots, getBotWithRole, getRole } from '@zakobot/database'
+import { getEnabledBots, getBotWithRole, getRole, updateBot } from '@zakobot/database'
 import type { GeneralSettings } from '@zakobot/shared'
 import { DiscordAdapter } from './discord-adapter.js'
 import { Agent } from '../llm/agent.js'
 import { ConversationService } from '../llm/conversation-service.js'
+import { fetchAvailableModels } from '../llm/list-models.js'
 import type { ToolRegistry } from '../tools/index.js'
 import type { SkillManager } from '../skills/index.js'
 
@@ -72,6 +73,27 @@ export class BotManager {
     }
 
     return this.conversations.listTopicMessages(topicId)
+  }
+
+  async deleteConversationTopic(instanceId: string, topicId: string): Promise<ConversationTopicRow> {
+    const row = this.requireBotRow(instanceId)
+    const topic = this.conversations.getTopic(topicId)
+
+    if (!topic || topic.botInstanceId !== row.instance.id) {
+      throw new Error(`Conversation topic "${topicId}" not found`)
+    }
+
+    const metadata = this.parseJsonRecord(topic.metadata)
+    if (topic.sourceType === 'discord_thread') {
+      const adapter = this.adapters.get(instanceId)
+      if (!adapter) {
+        throw new Error(`Bot instance "${instanceId}" is not running`)
+      }
+
+      await adapter.deleteConversationThread(topic, metadata)
+    }
+
+    return this.conversations.deleteTopic(topicId)!
   }
 
   startPanelConversation(instanceId: string): ConversationTopicRow {
@@ -155,7 +177,15 @@ export class BotManager {
     }
 
     const agent = this.createAgent(row)
-    const adapter = new DiscordAdapter(row.instance, row.role, agent, this.conversations, this.getGeneralSettings)
+    const adapter = new DiscordAdapter(
+      row.instance,
+      row.role,
+      agent,
+      this.conversations,
+      this.getGeneralSettings,
+      () => this.listAvailableModels(row.instance.id),
+      (modelId) => this.setModel(row.instance.id, modelId),
+    )
 
     await adapter.start()
     this.adapters.set(row.instance.id, adapter)
@@ -191,6 +221,39 @@ export class BotManager {
         platform: a.instance.platform,
       })),
     }
+  }
+
+  async listAvailableModels(instanceId: string) {
+    const row = this.requireBotRow(instanceId)
+    return fetchAvailableModels({
+      platformName: row.instance.llmPlatformName,
+      apiKey: row.instance.llmApiKey,
+      baseUrl: row.instance.llmBaseUrl,
+    })
+  }
+
+  async setModel(instanceId: string, modelId: string) {
+    const nextModel = modelId.trim()
+    if (!nextModel) {
+      throw new Error('Model ID is required')
+    }
+
+    const row = this.requireBotRow(instanceId)
+    const updated = updateBot(this.db, instanceId, {
+      llmModel: nextModel,
+      updatedAt: new Date(),
+    })
+
+    if (!updated) {
+      throw new Error('Failed to update bot model')
+    }
+
+    const adapter = this.adapters.get(instanceId)
+    if (adapter) {
+      adapter.applyRuntimeUpdate(updated.instance, this.createAgent(updated))
+    }
+
+    return updated.instance.llmModel
   }
 
   private createAgent(row: { instance: BotInstanceRow; role: RoleRow }) {

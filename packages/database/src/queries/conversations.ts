@@ -170,3 +170,17 @@ export function deleteConversationTopicsByBotId(db: DB, botInstanceId: string) {
     .where(eq(conversationTopics.botInstanceId, botInstanceId))
     .run()
 }
+
+export function deleteConversationTopicById(db: DB, topicId: string) {
+  const existing = getConversationTopic(db, topicId)
+  if (!existing) {
+    return undefined
+  }
+
+  db
+    .delete(conversationTopics)
+    .where(eq(conversationTopics.id, topicId))
+    .run()
+
+  return existing
+}

@@ -1,7 +1,9 @@
 import type { RoleRow } from '@zakobot/database'
-import type { AgentEvent, ChatMessage, GeneralSettings, LLMConfig, LLMTool, ToolApprovalCallback } from '@zakobot/shared'
+import type { AgentEvent, ChatMessage, GeneralSettings, LLMConfig } from '@zakobot/shared'
 import { LLMClient } from './client.js'
 import { ConversationService } from './conversation-service.js'
+import type { RespondStreamOptions } from './respond-stream-options.js'
+import { buildToolPrompt } from './tool-prompt.js'
 import type { ToolRegistry } from '../tools/index.js'
 import type { SkillManager } from '../skills/index.js'
 
@@ -19,55 +21,68 @@ export class Agent {
     this.client = new LLMClient(llmConfig)
   }
 
-  async *respondStream(topicId: string, requestApproval?: ToolApprovalCallback): AsyncGenerator<AgentEvent> {
+  async *respondStream(topicId: string, options: RespondStreamOptions = {}): AsyncGenerator<AgentEvent> {
     const role = this.getRole()
-    const { systemPrompt, maxToolCallRounds, sendTime, timezone } = this.getGeneralSettings()
     const history = this.conversations.listTopicHistory(topicId)
-    const enabledTools = this.parseEnabledTools(role.enabledTools)
-    const enabledSkills = this.parseEnabledSkills(role.enabledSkills)
-    const allowedTools = this.toolRegistry.listEnabled(enabledTools)
-    const skillPrompt = this.skillManager.buildPrompt(enabledSkills, this.getLatestUserText(history))
-    const toolPrompt = this.buildToolPrompt(allowedTools)
-    const historyWithTime = sendTime ? this.injectSendTime(history, timezone) : history
+    const { requestApproval, abortSignal, onRateLimitRetry } = options
+    const { messages, allowedTools, maxToolCallRounds } = this.buildConversationRequest(role, history)
 
-    const messages = [
-      ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
-      { role: 'system' as const, content: role.systemPrompt },
-      ...(skillPrompt ? [{ role: 'system' as const, content: skillPrompt }] : []),
-      ...(toolPrompt ? [{ role: 'system' as const, content: toolPrompt }] : []),
-      ...historyWithTime,
-    ]
-
-    yield* this.client.chatStream(messages, allowedTools, { maxToolCallRounds, requestApproval })
+    yield* this.client.chatStream(messages, allowedTools, {
+      maxToolCallRounds,
+      requestApproval,
+      abortSignal,
+      onRateLimitRetry,
+    })
   }
 
   async respond(topicId: string): Promise<string> {
     const role = this.getRole()
-    const { systemPrompt, maxToolCallRounds, sendTime, timezone } = this.getGeneralSettings()
     const history = this.conversations.listTopicHistory(topicId)
+    const { messages, allowedTools, maxToolCallRounds } = this.buildConversationRequest(role, history)
 
+    const reply = await this.client.chat(messages, allowedTools, maxToolCallRounds)
+    return reply
+  }
+
+  findEnabledToolName(suffix: string): string | null {
+    const enabledTools = this.parseEnabledTools(this.getRole().enabledTools)
+    return enabledTools.find(name => name.endsWith(suffix)) ?? null
+  }
+
+  async executeEnabledTool(name: string, args: Record<string, unknown>): Promise<string> {
+    const enabledTools = this.parseEnabledTools(this.getRole().enabledTools)
+    if (!enabledTools.includes(name)) {
+      throw new Error(`Tool "${name}" is not enabled for this role`)
+    }
+
+    const tool = this.toolRegistry.list().find(item => item.name === name)
+    if (!tool) {
+      throw new Error(`Tool "${name}" is not available`)
+    }
+
+    return tool.execute(args)
+  }
+
+  private buildConversationRequest(role: RoleRow, history: ChatMessage[]) {
+    const { systemPrompt, maxToolCallRounds, sendTime, timezone } = this.getGeneralSettings()
     const enabledTools = this.parseEnabledTools(role.enabledTools)
     const enabledSkills = this.parseEnabledSkills(role.enabledSkills)
     const allowedTools = this.toolRegistry.listEnabled(enabledTools)
     const skillPrompt = this.skillManager.buildPrompt(enabledSkills, this.getLatestUserText(history))
-    const toolPrompt = this.buildToolPrompt(allowedTools)
-
+    const toolPrompt = buildToolPrompt(allowedTools)
     const historyWithTime = sendTime ? this.injectSendTime(history, timezone) : history
 
-    const messages = [
-      ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
-      { role: 'system' as const, content: role.systemPrompt },
-      ...(skillPrompt
-        ? [{ role: 'system' as const, content: skillPrompt }]
-        : []),
-      ...(toolPrompt
-        ? [{ role: 'system' as const, content: toolPrompt }]
-        : []),
-      ...historyWithTime,
-    ]
-
-    const reply = await this.client.chat(messages, allowedTools, maxToolCallRounds)
-    return reply
+    return {
+      maxToolCallRounds,
+      allowedTools,
+      messages: [
+        ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
+        { role: 'system' as const, content: role.systemPrompt },
+        ...(skillPrompt ? [{ role: 'system' as const, content: skillPrompt }] : []),
+        ...(toolPrompt ? [{ role: 'system' as const, content: toolPrompt }] : []),
+        ...historyWithTime,
+      ],
+    }
   }
 
   private injectSendTime(history: ChatMessage[], timezone: string): ChatMessage[] {
@@ -93,76 +108,6 @@ export class Agent {
       : `${msg.content}${timeNote}`
     result[lastUserIndex] = { ...msg, content: newContent }
     return result
-  }
-
-  private buildToolPrompt(tools: LLMTool[]) {
-    if (!tools.length) {
-      return ''
-    }
-
-    const mcpNote = tools.some(tool => tool.name.startsWith('mcp__'))
-      ? ['名称以 mcp__ 开头的是 MCP 服务器暴露的工具。', '']
-      : []
-
-    return [
-      '以下工具已为当前角色启用。它们会通过模型工具调用接口发送；请根据用户需求主动判断是否调用工具，并严格遵守每个工具的使用说明。',
-      '',
-      ...mcpNote,
-      tools.map(tool => this.formatToolPromptSection(tool)).join('\n\n'),
-    ].join('\n')
-  }
-
-  private formatToolPromptSection(tool: LLMTool) {
-    const lines = [`工具：${tool.name}`]
-    const description = tool.description.trim()
-    const parameterSummary = this.formatParameterSummary(tool.parameters)
-    const instructions = tool.instructions?.trim()
-
-    if (description) {
-      lines.push(`说明：${description}`)
-    }
-
-    if (parameterSummary) {
-      lines.push(`参数：${parameterSummary}`)
-    }
-
-    if (instructions) {
-      lines.push(`使用说明：${instructions}`)
-    }
-
-    return lines.join('\n')
-  }
-
-  private formatParameterSummary(parameters: Record<string, unknown>) {
-    const properties = this.getRecord(parameters.properties)
-    const required = new Set(
-      Array.isArray(parameters.required)
-        ? parameters.required.filter((name): name is string => typeof name === 'string')
-        : [],
-    )
-
-    if (!properties || !Object.keys(properties).length) {
-      return ''
-    }
-
-    return Object.entries(properties)
-      .map(([name, schema]) => {
-        const record = this.getRecord(schema)
-        const type = typeof record?.type === 'string' ? record.type : 'unknown'
-        const description = typeof record?.description === 'string' && record.description.trim()
-          ? ` - ${record.description.trim()}`
-          : ''
-        const marker = required.has(name) ? '必填' : '可选'
-
-        return `${name}(${type}, ${marker})${description}`
-      })
-      .join('；')
-  }
-
-  private getRecord(value: unknown): Record<string, unknown> | undefined {
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : undefined
   }
 
   isToolSensitive(name: string): boolean {

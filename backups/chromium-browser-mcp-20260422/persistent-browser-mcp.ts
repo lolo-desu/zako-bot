@@ -1,9 +1,8 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import process from 'node:process'
 import { setTimeout as delay } from 'node:timers/promises'
-import { promisify } from 'node:util'
-import { firefox, type BrowserContext, type Page } from 'playwright-core'
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core'
 import { z } from 'zod'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -13,10 +12,6 @@ const DEFAULT_TIMEOUT_MS = 15000
 const DEFAULT_START_TIMEOUT_MS = 45000
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000
 const DEFAULT_LAUNCH_COMMAND = '/root/zako-bot/scripts/launch-browser-stack.sh'
-const DEFAULT_CAMOUFOX_PYTHON = '/root/.venvs/camoufox/bin/python'
-const DEFAULT_CAMOUFOX_OPTIONS_SCRIPT = '/root/zako-bot/scripts/resolve-camoufox-options.py'
-
-const execFileAsync = promisify(execFile)
 
 type BrowserMode = 'headless' | 'headed'
 
@@ -50,7 +45,6 @@ interface BrowserProfileConfig {
   label: string
   instanceName: string
   cdpUrl: string
-  wsPath?: string
   noVncUrl: string
   vncPassword: string
   launchCommand: string
@@ -66,18 +60,13 @@ interface BrowserHubConfig {
 
 interface ProfileRuntime {
   child?: ChildProcess
-  context?: BrowserContext
   startPromise?: Promise<void>
   idleTimer?: NodeJS.Timeout
   mode?: BrowserMode
 }
 
-interface CamoufoxLaunchConfig {
-  userDataDir: string
-  launchOptions: Parameters<typeof firefox.launchPersistentContext>[1]
-}
-
 class BrowserHub {
+  private browsers = new Map<string, Browser>()
   private runtimes = new Map<string, ProfileRuntime>()
 
   constructor(private profiles: BrowserProfileConfig[]) {}
@@ -166,15 +155,9 @@ class BrowserHub {
       await page.goto(input.url, { waitUntil: input.waitUntil ?? 'domcontentloaded', timeout: DEFAULT_TIMEOUT_MS })
     }
 
-    const result = await this.describePage(profile, page)
-
-    if (!profile.manualLoginMessage) {
-      return result
-    }
-
     return {
-      ...result,
-      message: profile.manualLoginMessage,
+      ...(await this.describePage(profile, page)),
+      message: profile.manualLoginMessage ?? 'Start the browser if needed, send the user the returned noVNC URL and vncPassword, let the user finish the login or verification in the persistent browser profile, then wait for the user to say the manual step is done.',
     }
   }
 
@@ -194,7 +177,9 @@ class BrowserHub {
   }
 
   private async page(profile: BrowserProfileConfig, mode: BrowserMode) {
-    const context = await this.context(profile, true, mode)
+    await this.ensureStarted(profile, mode)
+    const browser = await this.browser(profile, true, mode)
+    const context = this.defaultContext(browser)
     let page = context.pages().find((candidate: Page) => !candidate.url().startsWith('devtools://'))
 
     if (!page) {
@@ -207,26 +192,34 @@ class BrowserHub {
     return page
   }
 
-  private async context(profile: BrowserProfileConfig, keepAlive = true, mode: BrowserMode = 'headless') {
-    const runtime = this.runtime(profile.id)
-    if (this.isContextRunning(runtime.context)) {
+  private async browser(profile: BrowserProfileConfig, keepAlive = true, mode: BrowserMode = 'headless') {
+    const existing = this.browsers.get(profile.id)
+    if (existing?.isConnected()) {
       if (keepAlive) {
         this.touch(profile.id)
       }
-      return runtime.context
+      return existing
     }
 
     await this.ensureStarted(profile, mode, keepAlive)
-
-    if (!this.isContextRunning(runtime.context)) {
-      throw new Error(`Persistent browser profile "${profile.id}" failed to start a context`)
-    }
-
+    const browser = await chromium.connectOverCDP(profile.cdpUrl)
+    browser.on('disconnected', () => {
+      this.browsers.delete(profile.id)
+    })
+    this.browsers.set(profile.id, browser)
     if (keepAlive) {
       this.touch(profile.id)
     }
+    return browser
+  }
 
-    return runtime.context
+  private defaultContext(browser: Browser): BrowserContext {
+    const context = browser.contexts()[0]
+    if (!context) {
+      throw new Error('Persistent browser did not expose a default context')
+    }
+
+    return context
   }
 
   private async describePage(profile: BrowserProfileConfig, page: Page) {
@@ -273,11 +266,8 @@ class BrowserHub {
 
   private async peekPage(profile: BrowserProfileConfig) {
     try {
-      const context = this.runtime(profile.id).context
-      if (!this.isContextRunning(context)) {
-        return null
-      }
-
+      const browser = await this.browser(profile, false, this.runtime(profile.id).mode ?? 'headless')
+      const context = this.defaultContext(browser)
       const page = context.pages().find((candidate: Page) => !candidate.url().startsWith('devtools://'))
 
       if (!page) {
@@ -329,90 +319,80 @@ class BrowserHub {
 
   private async spawnProfile(profile: BrowserProfileConfig, mode: BrowserMode) {
     const runtime = this.runtime(profile.id)
-    let launchedContext: BrowserContext | undefined
-    try {
-      if (mode === 'headed') {
-        const child = spawn(profile.launchCommand, [...profile.launchArgs, 'headed-display'], {
-          stdio: 'ignore',
-        })
+    const child = spawn(profile.launchCommand, [...profile.launchArgs, mode], {
+      stdio: 'ignore',
+    })
 
-        runtime.child = child
-        child.once('exit', () => {
-          if (runtime.child !== child) {
-            return
-          }
-
-          runtime.child = undefined
-          runtime.mode = undefined
-          this.clearIdleTimer(profile.id)
-
-          if (runtime.context === launchedContext) {
-            void this.closeContext(profile.id)
-          }
-        })
-
-        await delay(1000)
-      }
-
-      const launch = await this.resolveCamoufoxLaunch(profile, mode)
-      const context = await firefox.launchPersistentContext(launch.userDataDir, {
-        ...launch.launchOptions,
-        timeout: profile.startTimeoutMs,
-      })
-
-      launchedContext = context
-      runtime.context = context
-      context.on('close', () => {
-        if (runtime.context !== context) {
-          return
-        }
-
-        runtime.context = undefined
-        runtime.mode = undefined
-
-        const child = runtime.child
+    runtime.child = child
+    child.once('exit', () => {
+      if (runtime.child === child) {
         runtime.child = undefined
-        this.clearIdleTimer(profile.id)
-        this.killChild(child)
-      })
+        runtime.mode = undefined
+      }
+      void this.disconnectBrowser(profile.id)
+      this.clearIdleTimer(profile.id)
+    })
+
+    try {
+      await this.waitForRunning(profile)
     }
     catch (error) {
-      await this.stopProfile(profile)
+      this.killChild(runtime.child)
+      runtime.child = undefined
+      runtime.mode = undefined
       throw error
     }
   }
 
+  private async waitForRunning(profile: BrowserProfileConfig) {
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < profile.startTimeoutMs) {
+      if (await this.isRunning(profile)) {
+        return
+      }
+
+      await delay(500)
+    }
+
+    throw new Error(`Timed out starting browser profile "${profile.id}"`)
+  }
+
   private async isRunning(profile: BrowserProfileConfig) {
-    return this.isContextRunning(this.runtime(profile.id).context)
+    const versionUrl = new URL('/json/version', profile.cdpUrl)
+
+    try {
+      const response = await fetch(versionUrl, {
+        signal: AbortSignal.timeout(1500),
+      })
+
+      return response.ok
+    }
+    catch {
+      return false
+    }
   }
 
   private async stopProfile(profile: BrowserProfileConfig) {
     this.clearIdleTimer(profile.id)
+    await this.disconnectBrowser(profile.id)
 
     const runtime = this.runtime(profile.id)
-    const context = runtime.context
-    runtime.context = undefined
-
     const child = runtime.child
     runtime.child = undefined
     runtime.mode = undefined
-
-    if (context) {
-      await context.close().catch(() => undefined)
-    }
 
     if (child) {
       await this.terminateChild(child)
     }
   }
 
-  private async closeContext(profileId: string) {
-    const runtime = this.runtime(profileId)
-    const context = runtime.context
-    runtime.context = undefined
+  private async disconnectBrowser(profileId: string) {
+    const browser = this.browsers.get(profileId)
+    this.browsers.delete(profileId)
 
-    if (context) {
-      await context.close().catch(() => undefined)
+    if (browser) {
+      await browser.close().catch(() => undefined)
     }
   }
 
@@ -458,27 +438,6 @@ class BrowserHub {
       child.kill('SIGTERM')
     }
   }
-
-  private isContextRunning(context?: BrowserContext): context is BrowserContext {
-    return !!context?.browser()?.isConnected()
-  }
-
-  private async resolveCamoufoxLaunch(profile: BrowserProfileConfig, mode: BrowserMode): Promise<CamoufoxLaunchConfig> {
-    const { stdout } = await execFileAsync(DEFAULT_CAMOUFOX_PYTHON, [DEFAULT_CAMOUFOX_OPTIONS_SCRIPT, profile.instanceName, mode], {
-      timeout: profile.startTimeoutMs,
-      maxBuffer: 1024 * 1024,
-    })
-
-    const parsed = JSON.parse(stdout) as Partial<CamoufoxLaunchConfig>
-    if (!parsed.userDataDir || !parsed.launchOptions) {
-      throw new Error(`Invalid Camoufox launch config for browser profile "${profile.id}"`)
-    }
-
-    return {
-      userDataDir: parsed.userDataDir,
-      launchOptions: parsed.launchOptions,
-    }
-  }
 }
 
 function loadConfig(configPath: string): BrowserHubConfig {
@@ -503,7 +462,6 @@ function loadConfig(configPath: string): BrowserHubConfig {
         label: item.label,
         instanceName: item.instanceName,
         cdpUrl: item.cdpUrl,
-        wsPath: typeof item.wsPath === 'string' && item.wsPath.length > 0 ? item.wsPath : undefined,
         noVncUrl: item.noVncUrl,
         vncPassword: item.vncPassword,
         launchCommand: item.launchCommand ?? DEFAULT_LAUNCH_COMMAND,

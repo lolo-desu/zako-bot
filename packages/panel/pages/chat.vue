@@ -19,6 +19,17 @@
     />
 
     <section v-else class="flex min-h-0 flex-1 flex-col gap-4">
+      <UAlert
+        v-if="deleteTarget"
+        color="error"
+        variant="subtle"
+        icon="i-heroicons-exclamation-triangle-20-solid"
+        title="确认删除话题"
+        :description="`话题「${deleteTarget.name}」删除后不可恢复。若它绑定了 Discord 子区，将一并删除对应子区。`"
+        :actions="deleteConfirmActions"
+        orientation="horizontal"
+      />
+
       <div class="grid gap-3 lg:grid-cols-[18rem_minmax(0,1fr)_auto]">
         <UFormField label="机器人" name="bot">
           <USelect
@@ -41,13 +52,24 @@
         </UFormField>
 
         <div class="flex items-end">
-          <UButton
-            label="新建话题"
-            icon="i-heroicons-plus-20-solid"
-            :loading="creatingTopic"
-            :disabled="!selectedBotId || creatingTopic"
-            @click="handleCreateTopic"
-          />
+          <div class="flex flex-wrap gap-2">
+            <UButton
+              label="新建话题"
+              icon="i-heroicons-plus-20-solid"
+              :loading="creatingTopic"
+              :disabled="!selectedBotId || creatingTopic || deletingTopicId.length > 0"
+              @click="handleCreateTopic"
+            />
+            <UButton
+              label="删除话题"
+              color="error"
+              variant="outline"
+              icon="i-heroicons-trash-20-solid"
+              :loading="deleteTarget ? deletingTopicId === deleteTarget.id : false"
+              :disabled="!selectedTopic || creatingTopic || deletingTopicId.length > 0"
+              @click="openDeleteConfirm"
+            />
+          </div>
         </div>
       </div>
 
@@ -231,9 +253,11 @@ const topicsPending = ref(false)
 const messagesPending = ref(false)
 const creatingTopic = ref(false)
 const submitting = ref(false)
+const deletingTopicId = ref('')
 const sendError = ref('')
 const topicsError = ref('')
 const messagesError = ref('')
+const deleteTarget = ref<ConversationTopic | null>(null)
 
 const botOptions = computed<SelectOption[]>(() =>
   (botsData.value?.data ?? []).map(bot => ({
@@ -287,6 +311,23 @@ const assistantMessageProps = computed(() => ({
   variant: 'soft' as const,
 }))
 
+const deleteConfirmActions = computed(() => [
+  {
+    label: '取消',
+    color: 'neutral' as const,
+    variant: 'outline' as const,
+    disabled: deletingTopicId.value.length > 0,
+    onClick: closeDeleteConfirm,
+  },
+  {
+    label: deleteTarget.value && deletingTopicId.value === deleteTarget.value.id ? '删除中' : '确认删除',
+    color: 'error' as const,
+    loading: deleteTarget.value ? deletingTopicId.value === deleteTarget.value.id : false,
+    disabled: deletingTopicId.value.length > 0,
+    onClick: handleDeleteTopic,
+  },
+])
+
 const promptUi = {
   base: 'min-h-[88px] pe-16 py-3',
   trailing: 'pe-3 inset-y-3 items-end',
@@ -332,6 +373,7 @@ watch(selectedBotId, async (botId) => {
   sendError.value = ''
   topicsError.value = ''
   messagesError.value = ''
+  deleteTarget.value = null
 
   if (!botId) {
     topics.value = []
@@ -424,6 +466,50 @@ async function handleCreateTopic() {
   }
 }
 
+function openDeleteConfirm() {
+  if (!selectedTopic.value) {
+    return
+  }
+
+  deleteTarget.value = selectedTopic.value
+}
+
+function closeDeleteConfirm() {
+  if (!deletingTopicId.value) {
+    deleteTarget.value = null
+  }
+}
+
+async function handleDeleteTopic() {
+  if (!selectedBotId.value || !deleteTarget.value) {
+    return
+  }
+
+  const topic = deleteTarget.value
+  deletingTopicId.value = topic.id
+  sendError.value = ''
+
+  try {
+    await $fetch<{ ok: true, data: ConversationTopic }>(`/api/chat/topics/${topic.id}`, {
+      method: 'DELETE',
+      query: {
+        botInstanceId: selectedBotId.value,
+      },
+    })
+
+    deleteTarget.value = null
+    messages.value = []
+    await loadTopics(selectedBotId.value)
+    toast.add({ title: `已删除话题「${topic.name}」`, color: 'success' })
+  }
+  catch (error: any) {
+    sendError.value = error?.data?.message ?? error?.message ?? '删除话题失败'
+  }
+  finally {
+    deletingTopicId.value = ''
+  }
+}
+
 async function handleSubmit(event: Event) {
   event.preventDefault()
 
@@ -458,6 +544,7 @@ async function handleSubmit(event: Event) {
 
 function topicSourceLabel(sourceType: string) {
   if (sourceType === 'panel') return '控制台'
+  if (sourceType === 'discord_thread') return 'Discord 子区'
   if (sourceType === 'discord_channel') return 'Discord 频道'
   return sourceType || '未知来源'
 }

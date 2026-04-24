@@ -1,251 +1,60 @@
-# ZakoBot
+# ZakoBot Fork Notes
 
-ZakoBot 是一个基于 TypeScript 的模块化 Bot 框架，当前提供：
+原项目：[`Mooooooon/zako-bot`](https://github.com/Mooooooon/zako-bot)
 
-- `zakobot` CLI
-- Discord Bot 运行时
-- 基于 OpenAI 兼容接口的模型调用
-- SQLite 数据库
-- Web 管理面板
+这个仓库的 README 只记录当前 fork 相对原项目新增或调整的内容；原项目已有的通用介绍、安装与基础使用说明请直接查看 upstream。
 
-如果你是第一次使用，按下面的“快速开始”走就可以。
+## 当前 fork 新增能力
 
-## 快速开始
+### Discord 会话模型
 
-### 1. 安装
+- 使用 `thread = session` 组织 Discord 会话
+- 在普通频道里直接 `@bot`，会自动创建新的子区并把该消息作为首条会话消息
+- `/new` 会始终新开一个独立会话和子区
+- `/stop` 会停止当前频道或当前子区中的进行中/排队请求
 
-任选一种方式：
+### 模型切换
 
-```bash
-npm install -g zakobot
-```
+- 新增 `/model` 命令，用于读取当前 bot 的可用模型列表
+- 模型列表会自动附带编号
+- 新增 `/model <编号>`，可将 bot 默认模型永久切换到对应模型
 
-或直接临时运行：
+### Discord 回复体验
 
-```bash
-npx zakobot init
-npx zakobot start
-```
+- 工具调用过程尽量聚合到同一条 Discord 消息里持续 `edit`
+- 减少工具审批、工具结果、最终回复分散成多条消息的情况
 
-如果你使用 pnpm：
+### 会话删除链路
 
-```bash
-pnpm dlx zakobot init
-pnpm dlx zakobot start
-```
+- panel 支持删除单个会话话题
+- 删除 Discord thread-backed 会话时，会先删除 Discord 子区，再删除数据库中的 session
+- 如果 thread 已被手动删除，则允许继续删除数据库中的 session
+- 如果 thread 删除因权限或接口失败，则 session 删除失败
 
-### 2. 初始化工作目录
+### 浏览器与人工接管
 
-```bash
-zakobot init
-```
+- 持久浏览器实现从 Chromium/CDP 路径迁移到 Camoufox
+- 新增 `/browser` 命令，直接拉起 headed 手动浏览器
+- 支持 noVNC 人工接管浏览器
+- 修复 `manual_login` / noVNC 在 headless 与 headed 切换时的 display stack 竞态问题
 
-默认会创建：
+### 代码结构调整
 
-```text
-~/.zakobot
-```
+- 将 `/model` 命令逻辑从 `discord-adapter.ts` 中拆出，独立到单独模块，减少适配层堆叠
 
-当前版本运行时默认会把数据库放在：
+## 相关文件
 
-```text
-~/.zakobot/data.db
-```
+- `packages/core/src/bot/discord-adapter.ts`
+- `packages/core/src/bot/model-command.ts`
+- `packages/core/src/bot/bot-manager.ts`
+- `packages/core/src/llm/list-models.ts`
+- `packages/core/src/mcp/persistent-browser-mcp.ts`
+- `packages/panel/pages/chat.vue`
+- `packages/panel/server/api/chat/topics/[id].delete.ts`
+- `scripts/launch-browser-stack.sh`
+- `scripts/resolve-camoufox-options.py`
 
-### 3. 启动
+## 说明
 
-```bash
-zakobot start
-```
-
-启动后打开：
-
-- Panel: [http://127.0.0.1:6324](http://127.0.0.1:6324)
-- Core API: [http://127.0.0.1:6325](http://127.0.0.1:6325)
-
-首次打开面板时需要登录，默认密码是：
-
-```text
-123456
-```
-
-登录后如果仍在使用默认密码，面板会提醒你尽快修改。
-
-## 命令说明
-
-```bash
-zakobot init
-zakobot start
-zakobot core
-zakobot panel
-```
-
-- `zakobot init`：初始化工作目录
-- `zakobot start`：同时启动 `core` 和 `panel`
-- `zakobot core`：只启动 Bot 核心进程
-- `zakobot panel`：只启动管理面板
-
-## 运行要求
-
-- 建议使用当前 LTS 版本的 Node.js
-- 可以访问你要使用的模型服务
-- 如果使用 Discord，需要准备 Bot Token
-
-## 首次使用建议
-
-启动后，建议按这个顺序配置：
-
-1. 打开管理面板
-2. 先在模型设置里配置你的模型平台
-3. 再创建角色、Bot 实例或测试聊天功能
-4. 确认 Core 状态和插件状态正常
-
-当前项目的重点是先把核心运行链路跑通，所以界面和功能仍在持续完善中。
-
-## 配置
-
-当前版本主要通过环境变量控制运行参数。
-
-### 常用环境变量
-
-```bash
-ZAKOBOT_HOME=~/.zakobot
-CORE_API_PORT=6325
-PANEL_PORT=6324
-DATABASE_URL=/path/to/zakobot.db
-CORE_API_URL=http://127.0.0.1:6325
-```
-
-说明：
-
-- `ZAKOBOT_HOME`：工作目录
-- `CORE_API_PORT`：Core API 端口
-- `PANEL_PORT`：Panel 端口
-- `DATABASE_URL`：SQLite 数据库文件路径
-- `CORE_API_URL`：Panel 调用 Core 时使用的地址
-
-### Windows PowerShell 示例
-
-```powershell
-$env:CORE_API_PORT="7001"
-$env:PANEL_PORT="7000"
-zakobot start
-```
-
-### macOS / Linux 示例
-
-```bash
-CORE_API_PORT=7001 PANEL_PORT=7000 zakobot start
-```
-
-## 数据位置
-
-默认情况下，ZakoBot 会在用户目录下保存自己的运行数据。
-
-```text
-~/.zakobot/
-  data.db
-  .env
-```
-
-其中：
-
-- `data.db` 是 SQLite 数据库
-- `.env` 会在 `zakobot init` 时创建，当前更适合作为配置模板参考
-
-## 项目结构
-
-如果你只是使用发布包，这一节可以先跳过。
-
-```text
-packages/core      Bot 运行时、插件、内部 API
-packages/panel     Web 管理面板
-packages/database  SQLite + Drizzle 数据层
-packages/cli       zakobot 命令行入口
-shared             跨包共享类型
-```
-
-## 本地开发
-
-如果你要参与开发仓库源码：
-
-### 安装依赖
-
-```bash
-pnpm install
-```
-
-### 启动开发环境
-
-```bash
-pnpm dev
-```
-
-这会并行启动：
-
-- `shared` watch build
-- `database` watch build
-- `core`
-- `panel`
-
-### 本地运行正式版
-
-如果不全局安装 `zakobot`，也可以在仓库目录中直接构建并运行正式产物：
-
-```bash
-pnpm start
-```
-
-该命令会先执行完整构建，再通过本地 CLI 启动 `core` 和 `panel`。
-
-### 常用命令
-
-```bash
-pnpm dev:deps
-pnpm dev:core
-pnpm dev:panel
-pnpm start
-pnpm build
-pnpm lint
-```
-
-### 数据库命令
-
-```bash
-pnpm --filter @zakobot/database db:generate
-pnpm --filter @zakobot/database db:migrate
-pnpm --filter @zakobot/database db:studio
-```
-
-## 当前实现说明
-
-目前仓库中的已知实现包括：
-
-- `core` 与 `panel` 是两个独立进程
-- 两者共享同一个 SQLite 数据库文件
-- `panel` 通过 `CORE_API_URL` 调用 `core`
-- 当前明确支持的平台是 Discord
-- 模型调用按 OpenAI 兼容接口接入
-
-## 排查思路
-
-### 启动后面板打不开
-
-先确认 `zakobot start` 没有报错，再检查端口是否被占用：
-
-- `6324` 用于 Panel
-- `6325` 用于 Core API
-
-如果端口冲突，改用环境变量指定新端口后重新启动。
-
-### Panel 能打开，但拿不到 Core 状态
-
-通常是 `core` 没有成功启动，或者 `CORE_API_URL` 配置不对。
-
-### 数据库位置不符合预期
-
-显式设置 `DATABASE_URL` 即可。
-
-## License
-
-MIT
+- 原项目通用文档请看 upstream README
+- 这个 README 只维护当前 fork 的增量改动

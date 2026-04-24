@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 INSTANCE="${1:?instance name is required}"
+MODE="${2:-headed-display}"
 ENV_FILE="/etc/zako-browser/${INSTANCE}.env"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -11,6 +12,11 @@ fi
 
 source "$ENV_FILE"
 
+if [[ "$MODE" != "headed-display" ]]; then
+  echo "Invalid browser mode: $MODE" >&2
+  exit 1
+fi
+
 export DISPLAY=":${DISPLAY_NUMBER}"
 
 mkdir -p "$PROFILE_DIR" "$RUNTIME_DIR"
@@ -19,7 +25,7 @@ chmod 700 "$PROFILE_DIR" "$RUNTIME_DIR"
 cleanup() {
   local code=$?
   trap - EXIT INT TERM
-  for pid in "${WEBSOCKIFY_PID:-}" "${VNC_PID:-}" "${FLUXBOX_PID:-}" "${CHROMIUM_PID:-}" "${XVFB_PID:-}"; do
+  for pid in "${WEBSOCKIFY_PID:-}" "${VNC_PID:-}" "${FLUXBOX_PID:-}" "${XVFB_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -56,20 +62,4 @@ VNC_PID=$!
 websockify --web=/usr/share/novnc/ "${NOVNC_BIND}:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" >/dev/null 2>&1 &
 WEBSOCKIFY_PID=$!
 
-/usr/bin/chromium \
-  --no-sandbox \
-  --disable-gpu \
-  --disable-dev-shm-usage \
-  --no-first-run \
-  --no-default-browser-check \
-  --password-store=basic \
-  --user-data-dir="$PROFILE_DIR" \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-debugging-port="$REMOTE_DEBUGGING_PORT" \
-  --window-size="${WINDOW_SIZE:-1440,960}" \
-  --window-position=0,0 \
-  --new-window "${START_URL:-about:blank}" \
-  >/dev/null 2>&1 &
-CHROMIUM_PID=$!
-
-wait -n "$XVFB_PID" "$FLUXBOX_PID" "$VNC_PID" "$WEBSOCKIFY_PID" "$CHROMIUM_PID"
+wait -n "$XVFB_PID" "$FLUXBOX_PID" "$VNC_PID" "$WEBSOCKIFY_PID"

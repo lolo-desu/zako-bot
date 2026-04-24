@@ -4,6 +4,21 @@ import type { Content, Part, Tool as GenAITool } from '@google/genai'
 import type { AgentEvent, LLMConfig, ChatMessage, LLMTool, ToolApprovalCallback } from '@zakobot/shared'
 
 const MAX_TOOL_CALL_ROUNDS = 8
+const RATE_LIMIT_MESSAGE = 'LLM 服务当前过于繁忙，请稍等片刻后重试。'
+const REQUEST_STOPPED_MESSAGE = '请求已停止。'
+const RATE_LIMIT_RETRY_DELAYS_MS = [5000, 10000] as const
+
+type RateLimitRetryHandler = (attempt: number, delayMs: number) => void | Promise<void>
+
+type LLMRequestOptions = {
+  abortSignal?: AbortSignal
+  onRateLimitRetry?: RateLimitRetryHandler
+}
+
+type LLMStreamOptions = LLMRequestOptions & {
+  maxToolCallRounds?: number
+  requestApproval?: ToolApprovalCallback
+}
 
 interface ServiceAccountCreds {
   type: string
@@ -75,7 +90,7 @@ export class LLMClient {
     const toolDefinitions = this.buildToolDefinitions(tools)
 
     for (let i = 0; i < maxToolCallRounds; i += 1) {
-      const response = await this.openai!.chat.completions.create({
+      const response = await this.requestWithRetry(() => this.openai!.chat.completions.create({
         model: this.config.model,
         messages: requestMessages,
         ...(toolDefinitions.length > 0
@@ -84,7 +99,7 @@ export class LLMClient {
               tool_choice: 'auto' as const,
             }
           : {}),
-      })
+      }))
 
       const message = response.choices[0]?.message
 
@@ -100,7 +115,7 @@ export class LLMClient {
 
     console.warn(`[LLM] Reached tool-call limit (${maxToolCallRounds}); requesting final answer without tools.`)
 
-    const finalResponse = await this.openai!.chat.completions.create({
+      const finalResponse = await this.requestWithRetry(() => this.openai!.chat.completions.create({
       model: this.config.model,
       messages: [
         ...requestMessages,
@@ -109,7 +124,7 @@ export class LLMClient {
           content: '你已经完成了足够的工具调用。不要再调用任何工具，直接基于现有上下文和工具结果给出最终回答；若信息仍不足，请明确说明不确定之处。',
         },
       ],
-    })
+    }))
 
     const finalMessage = finalResponse.choices[0]?.message
 
@@ -123,25 +138,31 @@ export class LLMClient {
   async *chatStream(
     messages: ChatMessage[],
     tools: LLMTool[] = [],
-    options: { maxToolCallRounds?: number; requestApproval?: ToolApprovalCallback } = {},
+    options: LLMStreamOptions = {},
   ): AsyncGenerator<AgentEvent> {
     if (this.genai) {
       yield* this.chatStreamVertex(messages, tools, options)
       return
     }
 
-    const { maxToolCallRounds = MAX_TOOL_CALL_ROUNDS, requestApproval } = options
+    const {
+      maxToolCallRounds = MAX_TOOL_CALL_ROUNDS,
+      requestApproval,
+      abortSignal,
+      onRateLimitRetry,
+    } = options
     const requestMessages: OpenAI.Chat.ChatCompletionMessageParam[] = messages.map(m => this.toOpenAIMessage(m))
     const toolDefinitions = this.buildToolDefinitions(tools)
 
     for (let round = 0; round < maxToolCallRounds; round++) {
-      const response = await this.openai!.chat.completions.create({
+      this.throwIfAborted(abortSignal)
+      const response = await this.requestWithRetry(() => this.openai!.chat.completions.create({
         model: this.config.model,
         messages: requestMessages,
         ...(toolDefinitions.length > 0
           ? { tools: toolDefinitions, tool_choice: 'auto' as const }
           : {}),
-      })
+      }), { abortSignal, onRateLimitRetry })
 
       const message = response.choices[0]?.message
       if (!message) throw new Error('LLM returned empty response')
@@ -209,7 +230,7 @@ export class LLMClient {
     }
 
     console.warn(`[LLM] Reached tool-call limit (${MAX_TOOL_CALL_ROUNDS}); requesting final answer without tools.`)
-    const finalResponse = await this.openai!.chat.completions.create({
+    const finalResponse = await this.requestWithRetry(() => this.openai!.chat.completions.create({
       model: this.config.model,
       messages: [
         ...requestMessages,
@@ -218,7 +239,7 @@ export class LLMClient {
           content: '你已经完成了足够的工具调用。不要再调用任何工具，直接基于现有上下文和工具结果给出最终回答；若信息仍不足，请明确说明不确定之处。',
         },
       ],
-    })
+    }), { abortSignal, onRateLimitRetry })
 
     const finalMessage = finalResponse.choices[0]?.message
     if (!finalMessage) throw new Error('LLM returned empty response after tool-call limit')
@@ -239,14 +260,14 @@ export class LLMClient {
     const genAITools = this.buildGenAITools(tools)
 
     for (let round = 0; round < maxRounds; round++) {
-      const response = await this.genai!.models.generateContent({
+      const response = await this.requestWithRetry(() => this.genai!.models.generateContent({
         model: this.config.model,
         contents,
         config: {
           ...(systemInstruction ? { systemInstruction } : {}),
           ...(genAITools.length ? { tools: genAITools } : {}),
         },
-      })
+      }))
 
       const parts: Part[] = response.candidates?.[0]?.content?.parts ?? []
       const funcCalls = parts.filter(p => p.functionCall)
@@ -278,32 +299,38 @@ export class LLMClient {
     }
 
     console.warn(`[LLM] Reached tool-call limit (${maxRounds}); requesting final answer without tools.`)
-    const final = await this.genai!.models.generateContent({
+    const final = await this.requestWithRetry(() => this.genai!.models.generateContent({
       model: this.config.model,
       contents,
       config: systemInstruction ? { systemInstruction } : {},
-    })
+    }))
     return final.candidates?.[0]?.content?.parts?.filter(p => p.text).map(p => p.text).join('') ?? ''
   }
 
   private async *chatStreamVertex(
     messages: ChatMessage[],
     tools: LLMTool[],
-    options: { maxToolCallRounds?: number; requestApproval?: ToolApprovalCallback },
+    options: LLMStreamOptions,
   ): AsyncGenerator<AgentEvent> {
-    const { maxToolCallRounds = MAX_TOOL_CALL_ROUNDS, requestApproval } = options
+    const {
+      maxToolCallRounds = MAX_TOOL_CALL_ROUNDS,
+      requestApproval,
+      abortSignal,
+      onRateLimitRetry,
+    } = options
     const { systemInstruction, contents } = await this.toGenAIContents(messages)
     const genAITools = this.buildGenAITools(tools)
 
     for (let round = 0; round < maxToolCallRounds; round++) {
-      const response = await this.genai!.models.generateContent({
+      this.throwIfAborted(abortSignal)
+      const response = await this.requestWithRetry(() => this.genai!.models.generateContent({
         model: this.config.model,
         contents,
         config: {
           ...(systemInstruction ? { systemInstruction } : {}),
           ...(genAITools.length ? { tools: genAITools } : {}),
         },
-      })
+      }), { abortSignal, onRateLimitRetry })
 
       const parts: Part[] = response.candidates?.[0]?.content?.parts ?? []
       const funcCalls = parts.filter(p => p.functionCall)
@@ -366,11 +393,11 @@ export class LLMClient {
     }
 
     console.warn(`[LLM] Reached tool-call limit (${maxToolCallRounds}); requesting final answer without tools.`)
-    const final = await this.genai!.models.generateContent({
+    const final = await this.requestWithRetry(() => this.genai!.models.generateContent({
       model: this.config.model,
       contents,
       config: systemInstruction ? { systemInstruction } : {},
-    })
+    }), { abortSignal, onRateLimitRetry })
     const finalText = final.candidates?.[0]?.content?.parts?.filter(p => p.text).map(p => p.text).join('') ?? ''
 
     if (finalText) {
@@ -559,5 +586,99 @@ export class LLMClient {
   private truncateLogMessage(value: string) {
     const normalized = value.replace(/\s+/g, ' ').trim()
     return normalized.length > 500 ? `${normalized.slice(0, 500)}...` : normalized
+  }
+
+  private async requestWithRetry<T>(operation: () => Promise<T>, options: LLMRequestOptions = {}): Promise<T> {
+    const { abortSignal, onRateLimitRetry } = options
+
+    for (let attempt = 0; attempt <= RATE_LIMIT_RETRY_DELAYS_MS.length; attempt += 1) {
+      this.throwIfAborted(abortSignal)
+
+      try {
+        return await operation()
+      }
+      catch (error) {
+        if (!this.isRateLimitError(error)) {
+          throw this.normalizeProviderError(error)
+        }
+
+        const delayMs = RATE_LIMIT_RETRY_DELAYS_MS[attempt]
+        if (delayMs == null) {
+          throw this.normalizeProviderError(error)
+        }
+
+        await onRateLimitRetry?.(attempt + 1, delayMs)
+        await this.sleepWithAbort(delayMs, abortSignal)
+      }
+    }
+
+    throw new Error(RATE_LIMIT_MESSAGE)
+  }
+
+  private normalizeProviderError(error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error)
+
+    if (this.isRateLimitError(error)) {
+      return new Error(RATE_LIMIT_MESSAGE)
+    }
+
+    return error instanceof Error ? error : new Error(message)
+  }
+
+  private isRateLimitError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    const status = this.readNumericField(error, 'status')
+      ?? this.readNumericField(this.readRecordField(error, 'response'), 'status')
+    const code = this.readStringField(error, 'code')
+      ?? this.readStringField(this.readRecordField(error, 'error'), 'code')
+
+    return status === 429
+      || code === 'rate_limit_exceeded'
+      || /too many concurrent requests|rate[_ -]?limit|rate limit exceeded/i.test(message)
+  }
+
+  private throwIfAborted(signal?: AbortSignal) {
+    if (signal?.aborted) {
+      throw new Error(REQUEST_STOPPED_MESSAGE)
+    }
+  }
+
+  private async sleepWithAbort(delayMs: number, signal?: AbortSignal) {
+    this.throwIfAborted(signal)
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, delayMs)
+
+      const onAbort = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        reject(new Error(REQUEST_STOPPED_MESSAGE))
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  private readRecordField(value: unknown, key: string): Record<string, unknown> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const field = (value as Record<string, unknown>)[key]
+    return field && typeof field === 'object' && !Array.isArray(field)
+      ? field as Record<string, unknown>
+      : undefined
+  }
+
+  private readNumericField(value: unknown, key: string): number | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const field = (value as Record<string, unknown>)[key]
+    return typeof field === 'number' ? field : undefined
+  }
+
+  private readStringField(value: unknown, key: string): string | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const field = (value as Record<string, unknown>)[key]
+    return typeof field === 'string' ? field : undefined
   }
 }

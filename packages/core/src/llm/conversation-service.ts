@@ -1,5 +1,6 @@
 import {
   appendConversationMessage,
+  deleteConversationTopicById,
   getConversationTopic,
   getActiveConversationTopic,
   listConversationTopics,
@@ -66,6 +67,10 @@ export class ConversationService {
 
   getTopic(topicId: string) {
     return getConversationTopic(this.db, topicId)
+  }
+
+  deleteTopic(topicId: string) {
+    return deleteConversationTopicById(this.db, topicId)
   }
 
   listTopics(botInstanceId: string) {

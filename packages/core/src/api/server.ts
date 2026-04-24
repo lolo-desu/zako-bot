@@ -938,6 +938,25 @@ export class ApiServer {
       }
     }
 
+    const conversationMatch = pathname.match(/^\/conversations\/([^/]+)$/)
+    if (conversationMatch && req.method === 'DELETE') {
+      const botInstanceId = searchParams.get('botInstanceId')?.trim()
+
+      if (!botInstanceId) {
+        return this.json(res, { ok: false, error: 'Bot instance ID is required' }, 400)
+      }
+
+      try {
+        const topic = await this.botManager.deleteConversationTopic(botInstanceId, conversationMatch[1])
+        return this.json(res, { ok: true, data: this.toConversationTopic(topic) })
+      }
+      catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to delete conversation topic'
+        const status = message.includes('not found') ? 404 : 400
+        return this.json(res, { ok: false, error: message }, status)
+      }
+    }
+
     if (pathname === '/bots' && req.method === 'POST') {
       try {
         const payload = this.parseBotInput(await this.readJson<BotEditorInput>(req))
