@@ -385,7 +385,9 @@ export class DiscordAdapter {
           return true
         }
 
-        const content = `🔧 等待工具授权：${name} ${this.formatToolPayload(input, 240)}`.trim()
+        const summary = this.buildToolActionSummary(name, input)
+        toolCallSummaries.set(callId, summary)
+        const content = `🔧 等待工具授权：${summary}`
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder()
@@ -413,7 +415,7 @@ export class DiscordAdapter {
           const timer = setTimeout(() => {
             this.pendingApprovals.delete(callId)
             pendingApprovalMessage = undefined
-            logLines.push(`⏰ 工具授权超时：${name}`)
+            logLines.push(`⏰ 工具授权超时：${summary}`)
             finish(false)
             void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }, TOOL_APPROVAL_TIMEOUT_MS)
@@ -422,7 +424,7 @@ export class DiscordAdapter {
             clearTimeout(timer)
             this.pendingApprovals.delete(callId)
             pendingApprovalMessage = undefined
-            logLines.push(`⏹️ 工具授权已停止：${name}`)
+            logLines.push(`⏹️ 工具授权已停止：${summary}`)
             reject(new Error(REQUEST_STOPPED_MESSAGE))
             void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
           }
@@ -434,7 +436,7 @@ export class DiscordAdapter {
               clearTimeout(timer)
               this.pendingApprovals.delete(callId)
               pendingApprovalMessage = undefined
-              logLines.push(approved ? `✅ 已允许工具：${name}` : `❌ 已拒绝工具：${name}`)
+              logLines.push(approved ? `✅ 已允许：${summary}` : `❌ 已拒绝：${summary}`)
               await interaction.update({ content: renderToolContent(), components: [] }).catch(() => {})
               finish(approved)
             },
@@ -444,6 +446,7 @@ export class DiscordAdapter {
     }
 
     let fullContent = ''
+    const toolCallSummaries = new Map<string, string>()
 
     for await (const event of this.agent.respondStream(topicId, {
       requestApproval,
@@ -465,19 +468,22 @@ export class DiscordAdapter {
           break
         case 'tool_call': {
           if (toolProcessMode === 'none') break
+          const summary = this.buildToolActionSummary(event.name, event.input)
+          toolCallSummaries.set(event.callId, summary)
           // Only send a brief notification when no approval dialog will cover it
           const approvalWillShow = toolApprovalMode !== 'none'
             && !(toolApprovalMode === 'sensitive' && !this.agent.isToolSensitive(event.name))
           if (!approvalWillShow) {
             this.throwIfStopped(abortSignal)
-            await pushLog(this.formatToolCall(event.name, event.input))
+            await pushLog(this.formatToolCall(summary))
           }
           break
         }
         case 'tool_result':
           if (toolProcessMode === 'full') {
             this.throwIfStopped(abortSignal)
-            await pushLog(this.formatToolResult(event))
+            await pushLog(this.formatToolResult(event, toolCallSummaries.get(event.callId)))
+            toolCallSummaries.delete(event.callId)
           }
           break
         case 'tool_limit_reached':
@@ -537,45 +543,192 @@ export class DiscordAdapter {
     return `已停止当前频道或话题中的${parts.join('，')}。`
   }
 
-  private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>): string {
+  private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>, summary?: string): string {
+    const action = summary ?? this.buildToolActionSummary(event.name, undefined)
     if (event.ok) {
-      return `✅ 工具完成：${event.name} -> ${this.formatToolPayload(event.result, 220)}`
+      return `✅ 已完成：${action}`
     }
 
     return event.result === 'User denied this tool call.'
-      ? `❌ 工具已拒绝：${event.name}`
-      : `⚠️ 工具执行失败：${event.name} -> ${this.formatToolPayload(event.result, 220)}`
+      ? `❌ 已拒绝：${action}`
+      : `⚠️ 执行失败：${action}${this.formatToolError(event.result)}`
   }
 
-  private formatToolCall(name: string, input: unknown): string {
-    const payload = this.formatToolPayload(input, 220)
-    return payload ? `🔧 调用工具：${name} ${payload}` : `🔧 调用工具：${name}`
+  private formatToolCall(summary: string): string {
+    return `🔧 ${summary}`
   }
 
-  private formatToolPayload(value: unknown, maxLength: number): string {
-    const raw = typeof value === 'string'
-      ? value
-      : this.safeJsonStringify(value)
+  private buildToolActionSummary(name: string, input: unknown) {
+    const toolName = name.toLowerCase()
+    const payload = this.asRecord(input)
+    const url = this.pickToolField(payload, ['url', 'noVncUrl'])
+    const selector = this.pickToolField(payload, ['selector', 'uid'])
+    const command = this.pickToolField(payload, ['command'])
+    const filePath = this.pickToolField(payload, ['filePath', 'requestFilePath', 'responseFilePath'])
+    const pattern = this.pickToolField(payload, ['pattern', 'query', 'text'])
+    const value = this.pickToolField(payload, ['value'])
 
-    if (!raw) {
+    if (toolName === 'bash' || toolName.endsWith('__bash') || toolName.endsWith('_bash')) {
+      return command ? `执行命令 ${this.inlineCode(this.truncateValue(command, 90))}` : '执行命令'
+    }
+
+    if (toolName === 'read' || toolName.endsWith('__read') || toolName.endsWith('_read')) {
+      if (filePath) return `读取文件 ${this.inlineCode(filePath)}`
+      if (url) return `查看页面 ${this.inlineCode(url)}`
+      return toolName.includes('browser') ? '查看页面内容' : '读取内容'
+    }
+
+    if (toolName === 'write' || toolName.endsWith('__write') || toolName.endsWith('_write')) {
+      return filePath ? `写入文件 ${this.inlineCode(filePath)}` : '写入文件'
+    }
+
+    if (toolName === 'edit' || toolName.endsWith('__edit') || toolName.endsWith('_edit')) {
+      return filePath ? `修改文件 ${this.inlineCode(filePath)}` : '修改文件'
+    }
+
+    if (toolName.includes('apply_patch')) {
+      return '应用代码补丁'
+    }
+
+    if (toolName === 'grep' || toolName.endsWith('__grep') || toolName.endsWith('_grep')) {
+      return pattern ? `搜索内容 ${this.inlineCode(this.truncateValue(pattern, 80))}` : '搜索内容'
+    }
+
+    if (toolName === 'glob' || toolName.endsWith('__glob') || toolName.endsWith('_glob')) {
+      return pattern ? `查找文件 ${this.inlineCode(this.truncateValue(pattern, 80))}` : '查找文件'
+    }
+
+    if (toolName.includes('webfetch') || toolName.includes('web_browse')) {
+      return url ? `访问网页 ${this.inlineCode(url)}` : '访问网页'
+    }
+
+    if (toolName.includes('web_search')) {
+      return pattern ? `搜索 ${this.inlineCode(this.truncateValue(pattern, 80))}` : '执行搜索'
+    }
+
+    if (toolName.includes('navigate') || toolName.endsWith('_open') || toolName.includes('goto')) {
+      return url ? `打开页面 ${this.inlineCode(url)}` : '打开页面'
+    }
+
+    if (toolName.includes('manual_login')) {
+      return url ? `启动手动浏览器并打开 ${this.inlineCode(url)}` : '启动手动浏览器'
+    }
+
+    if (toolName.endsWith('_start') || toolName.includes('browser_start')) {
+      return '启动浏览器'
+    }
+
+    if (toolName.endsWith('_stop') || toolName.includes('browser_stop')) {
+      return '停止浏览器'
+    }
+
+    if (toolName.endsWith('_status') || toolName.includes('browser_status')) {
+      return '查看浏览器状态'
+    }
+
+    if (toolName.includes('click')) {
+      return selector ? `点击 ${this.inlineCode(this.truncateValue(selector, 80))}` : '点击页面元素'
+    }
+
+    if (toolName.includes('type') || toolName.includes('fill')) {
+      if (selector || value) {
+        const target = selector ? `在 ${this.inlineCode(this.truncateValue(selector, 60))} 中` : ''
+        return `${target}输入内容`.trim()
+      }
+      return '输入内容'
+    }
+
+    if (toolName.includes('screenshot')) {
+      return filePath ? `截图到 ${this.inlineCode(filePath)}` : '截取页面截图'
+    }
+
+    if (toolName.includes('snapshot')) {
+      return '查看页面快照'
+    }
+
+    if (toolName.includes('wait_for')) {
+      return pattern ? `等待内容出现 ${this.inlineCode(this.truncateValue(pattern, 80))}` : '等待页面变化'
+    }
+
+    if (toolName.includes('evaluate')) {
+      return '执行页面脚本'
+    }
+
+    return `调用工具 ${this.inlineCode(name)}`
+  }
+
+  private formatToolError(result: string) {
+    const parsed = this.parseJsonObject(result)
+    const message = this.pickToolField(parsed, ['error', 'message', 'detail'])
+      ?? this.normalizeFreeText(result)
+
+    if (!message) {
       return ''
     }
 
-    const compact = raw.replace(/\s+/g, ' ').trim()
-    if (!compact) {
-      return ''
-    }
-
-    return compact.length <= maxLength ? compact : `${compact.slice(0, maxLength - 3)}...`
+    return ` (${this.truncateValue(message, 120)})`
   }
 
-  private safeJsonStringify(value: unknown): string {
+  private asRecord(value: unknown): Record<string, unknown> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined
+    }
+
+    return value as Record<string, unknown>
+  }
+
+  private parseJsonObject(value: string): Record<string, unknown> | undefined {
     try {
-      return JSON.stringify(value)
+      const parsed = JSON.parse(value) as unknown
+      return this.asRecord(parsed)
     }
     catch {
-      return String(value)
+      return undefined
     }
+  }
+
+  private pickToolField(payload: Record<string, unknown> | undefined, keys: string[]) {
+    if (!payload) {
+      return undefined
+    }
+
+    for (const key of keys) {
+      const value = payload[key]
+      if (typeof value === 'string') {
+        const normalized = value.replace(/\s+/g, ' ').trim()
+        if (normalized) {
+          return normalized
+        }
+      }
+      if (Array.isArray(value) && value.length > 0) {
+        const first = value[0]
+        if (typeof first === 'string') {
+          const normalized = first.replace(/\s+/g, ' ').trim()
+          if (normalized) {
+            return normalized
+          }
+        }
+      }
+    }
+
+    return undefined
+  }
+
+  private normalizeFreeText(value: string) {
+    const compact = value.replace(/\s+/g, ' ').trim()
+    if (!compact || compact.startsWith('{') || compact.startsWith('[')) {
+      return ''
+    }
+
+    return compact
+  }
+
+  private truncateValue(value: string, maxLength: number) {
+    return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`
+  }
+
+  private inlineCode(value: string) {
+    return `\`${value.replace(/`/g, '\\`')}\``
   }
 
   private getUserFacingErrorMessage(error: unknown) {
