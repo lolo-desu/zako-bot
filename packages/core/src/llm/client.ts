@@ -7,6 +7,7 @@ const MAX_TOOL_CALL_ROUNDS = 8
 const RATE_LIMIT_MESSAGE = 'LLM 服务当前过于繁忙，请稍等片刻后重试。'
 const REQUEST_STOPPED_MESSAGE = '请求已停止。'
 const RATE_LIMIT_RETRY_DELAYS_MS = [5000, 10000] as const
+const TOOL_LIMIT_FINAL_INSTRUCTION = '你已经完成了足够的工具调用。不要再调用任何工具，直接基于现有上下文和工具结果给出最终回答。你的回答必须先简要总结你已经做了什么、当前页面/任务处于什么状态、接下来准备做什么；如果存在阻塞或信息仍不足，也必须明确说出阻塞点或缺失信息。'
 
 type RateLimitRetryHandler = (attempt: number, delayMs: number) => void | Promise<void>
 
@@ -121,7 +122,7 @@ export class LLMClient {
         ...requestMessages,
         {
           role: 'system',
-          content: '你已经完成了足够的工具调用。不要再调用任何工具，直接基于现有上下文和工具结果给出最终回答；若信息仍不足，请明确说明不确定之处。',
+          content: TOOL_LIMIT_FINAL_INSTRUCTION,
         },
       ],
     }))
@@ -208,9 +209,13 @@ export class LLMClient {
           if (!tool) throw new Error(`Tool "${toolCall.function.name}" is not available`)
 
           if (requestApproval) {
-            const approved = await requestApproval(toolCall.id, toolCall.function.name, args)
-            if (!approved) {
-              result = 'User denied this tool call.'
+            const decision = await requestApproval(toolCall.id, toolCall.function.name, args)
+            if (!decision.approved) {
+              result = decision.guidance?.trim()
+                ? `User denied this tool call. Guidance: ${decision.guidance.trim()}`
+                : decision.reason?.trim()
+                    ? `User denied this tool call. Reason: ${decision.reason.trim()}`
+                    : 'User denied this tool call.'
               ok = false
               yield { type: 'tool_result', callId: toolCall.id, name: toolCall.function.name, result, ok }
               toolResultMessages.push({ role: 'tool', tool_call_id: toolCall.id, content: result })
@@ -243,7 +248,7 @@ export class LLMClient {
         ...requestMessages,
         {
           role: 'system',
-          content: '你已经完成了足够的工具调用。不要再调用任何工具，直接基于现有上下文和工具结果给出最终回答；若信息仍不足，请明确说明不确定之处。',
+          content: TOOL_LIMIT_FINAL_INSTRUCTION,
         },
       ],
     }), { abortSignal, onRateLimitRetry })
@@ -372,9 +377,13 @@ export class LLMClient {
           if (!tool) throw new Error(`Tool "${fc.name}" is not available`)
 
           if (requestApproval) {
-            const approved = await requestApproval(callId, fc.name!, args)
-            if (!approved) {
-              result = 'User denied this tool call.'
+            const decision = await requestApproval(callId, fc.name!, args)
+            if (!decision.approved) {
+              result = decision.guidance?.trim()
+                ? `User denied this tool call. Guidance: ${decision.guidance.trim()}`
+                : decision.reason?.trim()
+                    ? `User denied this tool call. Reason: ${decision.reason.trim()}`
+                    : 'User denied this tool call.'
               ok = false
               yield { type: 'tool_result', callId, name: fc.name!, result, ok }
               responseParts.push({ functionResponse: { name: fc.name!, response: { result } } })

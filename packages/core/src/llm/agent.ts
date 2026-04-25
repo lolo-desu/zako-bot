@@ -63,6 +63,26 @@ export class Agent {
     return tool.execute(args)
   }
 
+  async explainToolIntent(topicId: string, name: string, input: unknown, question?: string): Promise<string> {
+    const role = this.getRole()
+    const history = this.conversations.listTopicHistory(topicId)
+    const { messages } = this.buildConversationRequest(role, history)
+    const args = this.safeJsonStringify(input)
+    const reviewerQuestion = question?.trim() || '为什么现在需要执行这个操作？'
+
+    return this.client.chat([
+      ...messages,
+      {
+        role: 'system',
+        content: '你在帮助人工审核一项敏感工具调用。请直接对审核人说明：1) 助手为什么要做这件事；2) 具体会执行什么；3) 主要风险或影响；4) 如果拒绝，当前任务会卡在哪里。不要调用任何工具，不要泄露隐藏推理，不要编造结果。请使用简洁中文，控制在 4 行内。',
+      },
+      {
+        role: 'user',
+        content: `待审批工具：${name}\n参数：${args}\n审核人问题：${reviewerQuestion}`,
+      },
+    ], [], 1)
+  }
+
   private buildConversationRequest(role: RoleRow, history: ChatMessage[]) {
     const { systemPrompt, maxToolCallRounds, sendTime, timezone } = this.getGeneralSettings()
     const enabledTools = this.parseEnabledTools(role.enabledTools)
@@ -155,5 +175,14 @@ export class Agent {
       .filter(part => part.type === 'text')
       .map(part => part.text)
       .join('\n')
+  }
+
+  private safeJsonStringify(value: unknown) {
+    try {
+      return JSON.stringify(value)
+    }
+    catch {
+      return String(value)
+    }
   }
 }

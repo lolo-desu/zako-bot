@@ -5,4 +5,11 @@ export type AgentEvent =
   | { type: 'tool_limit_reached'; limit: number }
   | { type: 'done'; content: string }
 
-export type ToolApprovalCallback = (callId: string, name: string, input: unknown) => Promise<boolean>
+export type ToolApprovalDecision = {
+  approved: boolean
+  always?: boolean
+  reason?: string
+  guidance?: string
+}
+
+export type ToolApprovalCallback = (callId: string, name: string, input: unknown) => Promise<ToolApprovalDecision>

@@ -5,16 +5,20 @@ import {
   ButtonBuilder,
   ButtonStyle,
   MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js'
-import type { ButtonInteraction, Message, MessageEditOptions, TextBasedChannel } from 'discord.js'
+import type { ButtonInteraction, ChatInputCommandInteraction, Interaction, Message, MessageEditOptions, ModalSubmitInteraction, TextBasedChannel } from 'discord.js'
 import type { BotInstanceRow, RoleRow } from '@zakobot/database'
-import type { AgentEvent, GeneralSettings, ToolApprovalCallback } from '@zakobot/shared'
+import type { AgentEvent, GeneralSettings, ToolApprovalCallback, ToolApprovalDecision } from '@zakobot/shared'
 import type { Agent } from '../llm/agent.js'
 import type { ConversationScope, ConversationService } from '../llm/conversation-service.js'
 import { buildAssistantMessageChunks } from './discord-stream-renderer.js'
 import { DiscordModelCommand, MODEL_COMMAND } from './model-command.js'
 
 const TOOL_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+const TOOL_APPROVAL_AI_REPLY_TTL_MS = 30 * 1000
 const COMMAND_REGISTRATION_COOLDOWN_MS = 5 * 60 * 1000
 const LLM_RATE_LIMIT_MESSAGE = 'LLM 服务当前过于繁忙，请稍等片刻后重试。'
 const REQUEST_STOPPED_MESSAGE = '请求已停止。'
@@ -43,10 +47,37 @@ type QueuedRequest = {
 }
 
 type PendingApproval = {
-  finish: (approved: boolean, interaction: ButtonInteraction) => Promise<void>
+  finish: (decision: ToolApprovalDecision) => Promise<void>
+  remember: () => Promise<void>
+  guide: (interaction: ModalSubmitInteraction, guidance: string) => Promise<void>
+  askAI: (interaction: ModalSubmitInteraction, question: string) => Promise<void>
+}
+
+type ToolProgressEntry = {
+  kind: 'tool'
+  id: string
+  status: string
+  summary: string
+  command?: string
+  note?: string
+}
+
+type NoticeProgressEntry = {
+  kind: 'notice'
+  id: string
+  content: string
+}
+
+type ProgressEntry = ToolProgressEntry | NoticeProgressEntry
+
+type PendingApprovalMessage = {
+  entry: ToolProgressEntry
+  components: ActionRowBuilder<ButtonBuilder>[]
 }
 
 type CreateMessage = (payload: MsgPayload) => Promise<Message>
+
+type RepliableInteraction = ButtonInteraction | ModalSubmitInteraction | ChatInputCommandInteraction
 
 const MAX_DISCORD_MESSAGE_CHARS = 1900
 
@@ -70,6 +101,7 @@ const DEFAULT_MANUAL_BROWSER_URL = 'https://www.google.com'
 export class DiscordAdapter {
   readonly client: Client
   private pendingApprovals = new Map<string, PendingApproval>()
+  private rememberedApprovals = new Map<string, Set<string>>()
   private requestQueue: QueuedRequest[] = []
   private activeRequest?: QueuedRequest
   private processingQueue = false
@@ -312,18 +344,30 @@ export class DiscordAdapter {
     queuedNotice?: string,
   ): Promise<string> {
     const { toolApprovalMode, toolProcessMode } = this.getGeneralSettings()
-    const logLines: string[] = queuedNotice ? [queuedNotice] : []
+    const logEntries: ProgressEntry[] = queuedNotice
+      ? [{ kind: 'notice', id: 'queue_notice', content: queuedNotice }]
+      : []
+    let noticeCounter = 0
     let streamedText = ''
     let toolProgressMessage: Message | undefined
-    let pendingApprovalMessage: { content: string; components: ActionRowBuilder<ButtonBuilder>[] } | undefined
+    let pendingApprovalMessage: PendingApprovalMessage | undefined
     const assistantMessages: { message: Message; content: string }[] = []
 
     const renderToolContent = () => {
-      const sections = [...logLines, pendingApprovalMessage?.content]
-        .filter((section): section is string => Boolean(section && section.trim()))
-        .map(section => section.trim())
+      const currentEntry = pendingApprovalMessage?.entry ?? logEntries.at(-1)
+      const historyEntries = pendingApprovalMessage
+        ? logEntries
+        : logEntries.slice(0, -1)
+      const recentHistory = historyEntries.slice(-4)
 
-      const content = sections.join('\n').trim() || '（处理中...）'
+      const content = [
+        recentHistory.length > 0 ? this.renderProgressHistory(recentHistory) : '',
+        currentEntry ? this.renderProgressCurrent(currentEntry) : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+        .trim() || '（处理中...）'
+
       if (content.length <= MAX_DISCORD_MESSAGE_CHARS) {
         return content
       }
@@ -333,7 +377,7 @@ export class DiscordAdapter {
     }
 
     const commitToolMessage = async () => {
-      if (!logLines.length && !pendingApprovalMessage && !toolProgressMessage) {
+      if (!logEntries.length && !pendingApprovalMessage && !toolProgressMessage) {
         return undefined
       }
 
@@ -350,8 +394,24 @@ export class DiscordAdapter {
       return toolProgressMessage
     }
 
-    const pushLog = async (line: string) => {
-      logLines.push(line)
+    const pushNotice = async (line: string) => {
+      logEntries.push({ kind: 'notice', id: `notice_${++noticeCounter}`, content: line })
+      await commitToolMessage()
+    }
+
+    const setToolLog = async (entry: ToolProgressEntry) => {
+      const existing = logEntries.find(candidate => candidate.id === entry.id)
+      if (existing) {
+        if (existing.kind === 'tool') {
+          existing.status = entry.status
+          existing.summary = entry.summary
+          existing.command = entry.command
+          existing.note = entry.note
+        }
+      }
+      else {
+        logEntries.push(entry)
+      }
       await commitToolMessage()
     }
 
@@ -377,72 +437,128 @@ export class DiscordAdapter {
 
     let requestApproval: ToolApprovalCallback | undefined
 
-    if (toolApprovalMode !== 'none') {
-      requestApproval = async (callId, name, input) => {
-        this.throwIfStopped(abortSignal)
+    requestApproval = async (callId, name, input) => {
+      this.throwIfStopped(abortSignal)
 
-        if (toolApprovalMode === 'sensitive' && !this.agent.isToolSensitive(name)) {
-          return true
-        }
-
-        const summary = this.buildToolActionSummary(name, input)
-        toolCallSummaries.set(callId, summary)
-        const content = `🔧 等待工具授权：${summary}`
-
-        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`tool_approve:${callId}`)
-            .setLabel('允许')
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId(`tool_deny:${callId}`)
-            .setLabel('拒绝')
-            .setStyle(ButtonStyle.Danger),
-        )
-
-        pendingApprovalMessage = { content, components: [row] }
-        const approvalMsg = await commitToolMessage()
-        if (!approvalMsg) {
-          throw new Error('Failed to create tool approval message')
-        }
-
-        return new Promise<boolean>((resolve, reject) => {
-          const finish = (value: boolean) => {
-            abortSignal?.removeEventListener('abort', onAbort)
-            resolve(value)
-          }
-
-          const timer = setTimeout(() => {
-            this.pendingApprovals.delete(callId)
-            pendingApprovalMessage = undefined
-            logLines.push(`⏰ 工具授权超时：${summary}`)
-            finish(false)
-            void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
-          }, TOOL_APPROVAL_TIMEOUT_MS)
-
-          const onAbort = () => {
-            clearTimeout(timer)
-            this.pendingApprovals.delete(callId)
-            pendingApprovalMessage = undefined
-            logLines.push(`⏹️ 工具授权已停止：${summary}`)
-            reject(new Error(REQUEST_STOPPED_MESSAGE))
-            void approvalMsg.edit({ content: renderToolContent(), components: [] }).catch(() => {})
-          }
-
-          abortSignal?.addEventListener('abort', onAbort, { once: true })
-
-          this.pendingApprovals.set(callId, {
-            finish: async (approved, interaction) => {
-              clearTimeout(timer)
-              this.pendingApprovals.delete(callId)
-              pendingApprovalMessage = undefined
-              logLines.push(approved ? `✅ 已允许：${summary}` : `❌ 已拒绝：${summary}`)
-              await interaction.update({ content: renderToolContent(), components: [] }).catch(() => {})
-              finish(approved)
-            },
-          })
-        })
+      if (!this.shouldRequireApproval(name, input, toolApprovalMode)) {
+        return { approved: true }
       }
+
+      const fingerprint = this.buildApprovalFingerprint(name, input)
+      if (this.hasRememberedApproval(topicId, fingerprint)) {
+        await setToolLog(this.createToolProgressEntry(callId, name, input, '已自动通过', '已按“始终”规则自动放行'))
+        return { approved: true }
+      }
+
+      const summary = this.buildToolActionSummary(name, input)
+      toolCallSummaries.set(callId, summary)
+      const entry = this.buildApprovalEntry(callId, name, input, summary)
+
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tool_approve:${callId}`)
+          .setLabel('通过')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`tool_always:${callId}`)
+          .setLabel('始终')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`tool_deny:${callId}`)
+          .setLabel('拒绝')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`tool_guide:${callId}`)
+          .setLabel('指导')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`tool_ask_ai:${callId}`)
+          .setLabel('询问')
+          .setStyle(ButtonStyle.Secondary),
+      )
+
+      pendingApprovalMessage = { entry, components: [row] }
+      const approvalMsg = await commitToolMessage()
+      if (!approvalMsg) {
+        throw new Error('Failed to create tool approval message')
+      }
+
+      return new Promise<ToolApprovalDecision>((resolve, reject) => {
+        const finalize = async (decision: ToolApprovalDecision, logLine: string) => {
+          clearTimeout(timer)
+          abortSignal?.removeEventListener('abort', onAbort)
+          this.pendingApprovals.delete(callId)
+          pendingApprovalMessage = undefined
+          await setToolLog(this.buildFinishedToolEntry(callId, name, input, summary, decision, logLine))
+          resolve(decision)
+        }
+
+        const timer = setTimeout(() => {
+          void finalize({ approved: false, reason: '审批超时，未执行。' }, `⏰ 工具授权超时：${summary}`)
+        }, TOOL_APPROVAL_TIMEOUT_MS)
+
+        const onAbort = () => {
+          clearTimeout(timer)
+          this.pendingApprovals.delete(callId)
+          pendingApprovalMessage = undefined
+          void setToolLog(this.createToolProgressEntry(callId, name, input, '已停止', '工具授权已停止'))
+          reject(new Error(REQUEST_STOPPED_MESSAGE))
+        }
+
+        abortSignal?.addEventListener('abort', onAbort, { once: true })
+
+        this.pendingApprovals.set(callId, {
+          finish: async (decision) => {
+            const reasonText = !decision.approved && decision.reason?.trim()
+              ? `（原因：${decision.reason.trim()}）`
+              : ''
+            const guidanceText = !decision.approved && decision.guidance?.trim()
+              ? `（指导：${decision.guidance.trim()}）`
+              : ''
+            await finalize(
+              decision,
+              decision.approved
+                ? `✅ 已通过：${summary}`
+                : decision.guidance?.trim()
+                    ? `🧭 已指导：${summary}${guidanceText}`
+                    : `❌ 已拒绝：${summary}${reasonText}`,
+            )
+          },
+          remember: async () => {
+            this.rememberApproval(topicId, fingerprint)
+            await finalize(
+              { approved: true, always: true },
+              `♾️ 已设为始终通过：${summary}`,
+            )
+          },
+          guide: async (interaction, guidance) => {
+            const trimmed = guidance.trim()
+            await this.replyEphemeral(interaction, trimmed ? '已记录指导，模型会按你的要求改方案。' : '未填写指导内容，已按拒绝处理。')
+            await finalize(
+              trimmed ? { approved: false, guidance: trimmed } : { approved: false },
+              trimmed ? `🧭 已指导：${summary}（指导：${trimmed}）` : `❌ 已拒绝：${summary}`,
+            )
+          },
+          askAI: async (interaction, question) => {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {})
+            try {
+              const answer = await this.agent.explainToolIntent(topicId, name, input, question)
+              await interaction.editReply({
+                content: this.buildApprovalAiReply(summary, question, answer),
+              }).catch(() => {})
+              setTimeout(() => {
+                void interaction.deleteReply().catch(() => {})
+              }, TOOL_APPROVAL_AI_REPLY_TTL_MS)
+            }
+            catch (error) {
+              const message = error instanceof Error ? error.message : String(error)
+              await interaction.editReply({
+                content: `无法获取解释：${message}`,
+              }).catch(() => {})
+            }
+          },
+        })
+      })
     }
 
     let fullContent = ''
@@ -453,7 +569,7 @@ export class DiscordAdapter {
       abortSignal,
       onRateLimitRetry: async (_attempt, delayMs) => {
         this.throwIfStopped(abortSignal)
-        await pushLog(`${LLM_RATE_LIMIT_MESSAGE}，将在 ${Math.ceil(delayMs / 1000)} 秒后自动重试。可通过 /stop 停止当前请求。`)
+        await pushNotice(`${LLM_RATE_LIMIT_MESSAGE}，将在 ${Math.ceil(delayMs / 1000)} 秒后自动重试。可通过 /stop 停止当前请求。`)
       },
     })) {
       this.throwIfStopped(abortSignal)
@@ -471,25 +587,25 @@ export class DiscordAdapter {
           const summary = this.buildToolActionSummary(event.name, event.input)
           toolCallSummaries.set(event.callId, summary)
           // Only send a brief notification when no approval dialog will cover it
-          const approvalWillShow = toolApprovalMode !== 'none'
-            && !(toolApprovalMode === 'sensitive' && !this.agent.isToolSensitive(event.name))
+          const approvalWillShow = this.shouldRequireApproval(event.name, event.input, toolApprovalMode)
+            && !this.hasRememberedApproval(topicId, this.buildApprovalFingerprint(event.name, event.input))
           if (!approvalWillShow) {
             this.throwIfStopped(abortSignal)
-            await pushLog(this.formatToolCall(summary))
+            await setToolLog(this.formatToolCall(event.callId, event.name, event.input, summary))
           }
           break
         }
         case 'tool_result':
           if (toolProcessMode === 'full') {
             this.throwIfStopped(abortSignal)
-            await pushLog(this.formatToolResult(event, toolCallSummaries.get(event.callId)))
+            await setToolLog(this.formatToolResult(event, toolCallSummaries.get(event.callId)))
             toolCallSummaries.delete(event.callId)
           }
           break
         case 'tool_limit_reached':
           this.throwIfStopped(abortSignal)
           console.warn(`[Discord] Tool-call limit reached for "${this.instance.name}" topic=${topicId} limit=${event.limit}`)
-          await pushLog(`⚠️ 已达到工具调用上限（${event.limit} 次），模型现在会停止继续调用工具，并基于已有信息直接给出回复。`)
+          await pushNotice(`⚠️ 已达到工具调用上限（${event.limit} 次），模型现在会停止继续调用工具，并基于已有信息直接给出回复。`)
           break
         case 'done':
           fullContent = event.content
@@ -543,19 +659,124 @@ export class DiscordAdapter {
     return `已停止当前频道或话题中的${parts.join('，')}。`
   }
 
-  private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>, summary?: string): string {
-    const action = summary ?? this.buildToolActionSummary(event.name, undefined)
-    if (event.ok) {
-      return `✅ 已完成：${action}`
-    }
+  private renderProgressHistory(entries: ProgressEntry[]) {
+    const lines = entries.map((entry) => {
+      if (entry.kind === 'notice') {
+        return `- ℹ️ ${this.truncateValue(entry.content, 120)}`
+      }
 
-    return event.result === 'User denied this tool call.'
-      ? `❌ 已拒绝：${action}`
-      : `⚠️ 执行失败：${action}${this.formatToolError(event.result)}`
+      const badge = this.formatStatusBadge(entry.status)
+      const command = entry.command ? ` ${this.inlineCode(this.truncateValue(entry.command, 90))}` : ''
+      const note = entry.note ? ` · ${this.truncateValue(entry.note, 70)}` : ''
+      return `- ${badge} ${entry.summary}${command}${note}`
+    })
+
+    return ['**最近记录**', ...lines].join('\n')
   }
 
-  private formatToolCall(summary: string): string {
-    return `🔧 ${summary}`
+  private renderProgressCurrent(entry: ProgressEntry) {
+    if (entry.kind === 'notice') {
+      return ['**当前状态**', `> ℹ️ ${entry.content}`].join('\n')
+    }
+
+    const badge = this.formatStatusBadge(entry.status)
+    const lines = [
+      '**当前操作**',
+      `> 状态：${badge}`,
+      `> 操作：${entry.summary}`,
+    ]
+
+    if (entry.command) {
+      lines.push(`> 命令：${this.inlineCode(this.truncateValue(entry.command, 120))}`)
+    }
+
+    if (entry.note) {
+      lines.push(`> 说明：${this.truncateValue(entry.note, 140)}`)
+    }
+
+    return lines.join('\n')
+  }
+
+  private formatStatusBadge(status: string) {
+    const icons: Record<string, string> = {
+      '处理中': '⏳ 处理中',
+      '等待审批': '⚠️ 等待审批',
+      '已自动通过': '♾️ 已自动通过',
+      '已完成': '☑️ 已完成',
+      '已指导': '🧭 已指导',
+      '已拒绝': '✖️ 已拒绝',
+      '失败': '⚠️ 执行失败',
+      '已通过': '✅ 已通过',
+      '已设为始终': '♾️ 已设为始终',
+      '已停止': '⏹️ 已停止',
+    }
+
+    return icons[status] ?? status
+  }
+
+  private formatToolResult(event: Extract<AgentEvent, { type: 'tool_result' }>, summary?: string): ToolProgressEntry {
+    const action = summary ?? this.buildToolActionSummary(event.name, undefined)
+    if (event.ok) {
+      return this.createToolProgressEntry(event.callId, event.name, undefined, '已完成', undefined, action)
+    }
+
+    const guidance = this.extractGuidance(event.result)
+    if (guidance !== undefined) {
+      return this.createToolProgressEntry(event.callId, event.name, undefined, '已指导', guidance || undefined, action)
+    }
+
+    const deniedReason = this.extractDeniedReason(event.result)
+    if (deniedReason !== undefined) {
+      return this.createToolProgressEntry(event.callId, event.name, undefined, '已拒绝', deniedReason || undefined, action)
+    }
+
+    const error = this.formatToolError(event.result).replace(/^[\s(]+|[)\s]+$/g, '') || undefined
+    return this.createToolProgressEntry(event.callId, event.name, undefined, '失败', error, action)
+  }
+
+  private formatToolCall(callId: string, name: string, input: unknown, summary: string): ToolProgressEntry {
+    return this.createToolProgressEntry(callId, name, input, '处理中', undefined, summary)
+  }
+
+  private createToolProgressEntry(
+    id: string,
+    name: string,
+    input: unknown,
+    status: string,
+    note?: string,
+    summary?: string,
+  ): ToolProgressEntry {
+    return {
+      kind: 'tool',
+      id,
+      status,
+      summary: summary ?? this.buildToolActionSummary(name, input),
+      command: this.isShellLikeTool(name) ? this.getToolCommand(input) : undefined,
+      note,
+    }
+  }
+
+  private buildFinishedToolEntry(
+    callId: string,
+    name: string,
+    input: unknown,
+    summary: string,
+    decision: ToolApprovalDecision,
+    _logLine: string,
+  ) {
+    if (decision.always) {
+      return this.createToolProgressEntry(callId, name, input, '已设为始终', '后续同类命令将自动放行', summary)
+    }
+
+    if (decision.approved) {
+      return this.createToolProgressEntry(callId, name, input, '已通过', undefined, summary)
+    }
+
+    if (decision.guidance?.trim()) {
+      return this.createToolProgressEntry(callId, name, input, '已指导', decision.guidance.trim(), summary)
+    }
+
+    return this.createToolProgressEntry(callId, name, input, '已拒绝', decision.reason?.trim(), summary)
   }
 
   private buildToolActionSummary(name: string, input: unknown) {
@@ -575,7 +796,7 @@ export class DiscordAdapter {
       || toolName.endsWith('__bash')
       || toolName.endsWith('_bash')
     ) {
-      return command ? `执行命令 ${this.inlineCode(this.truncateValue(command, 90))}` : '执行命令'
+      return '执行命令'
     }
 
     if (toolName === 'read' || toolName.endsWith('__read') || toolName.endsWith('_read')) {
@@ -737,6 +958,170 @@ export class DiscordAdapter {
     return `\`${value.replace(/`/g, '\\`')}\``
   }
 
+  private isShellLikeTool(name: string) {
+    const toolName = name.toLowerCase()
+    return toolName === 'shell_exec'
+      || toolName === 'bash'
+      || toolName.includes('shell')
+      || toolName.endsWith('__bash')
+      || toolName.endsWith('_bash')
+  }
+
+  private getToolCommand(input: unknown) {
+    const payload = this.asRecord(input)
+    return this.pickToolField(payload, ['command'])
+  }
+
+  private getDangerousShellReason(command: string) {
+    const normalized = command.toLowerCase().replace(/\s+/g, ' ').trim()
+    const patterns: Array<{ pattern: RegExp; reason: string }> = [
+      { pattern: /(^|\s)rm\s+/, reason: '删除文件或目录' },
+      { pattern: /(^|\s)rmdir\s+/, reason: '删除目录' },
+      { pattern: /(^|\s)del\s+/, reason: '删除文件' },
+      { pattern: /(^|\s)rd\s+\/s\b/, reason: '递归删除目录' },
+      { pattern: /(^|\s)unlink\s+/, reason: '移除文件链接' },
+      { pattern: /(^|\s)mv\s+/, reason: '移动或覆盖现有文件' },
+      { pattern: /(^|\s)dd\s+/, reason: '直接写入磁盘或镜像' },
+      { pattern: /(^|\s)mkfs(\.|\s|$)/, reason: '格式化文件系统' },
+      { pattern: /(^|\s)fdisk\s+/, reason: '修改磁盘分区' },
+      { pattern: /(^|\s)parted\s+/, reason: '调整磁盘分区' },
+      { pattern: /(^|\s)shutdown\s+/, reason: '关闭系统' },
+      { pattern: /(^|\s)reboot(\s|$)/, reason: '重启系统' },
+      { pattern: /(^|\s)poweroff(\s|$)/, reason: '关闭系统电源' },
+      { pattern: /(^|\s)halt(\s|$)/, reason: '停止系统' },
+      { pattern: /(^|\s)systemctl\s+(stop|restart|disable|mask|kill)\b/, reason: '修改系统服务状态' },
+      { pattern: /(^|\s)service\s+\S+\s+(stop|restart)\b/, reason: '修改服务运行状态' },
+      { pattern: /(^|\s)killall\s+/, reason: '终止一组进程' },
+      { pattern: /(^|\s)pkill\s+/, reason: '按条件终止进程' },
+      { pattern: /(^|\s)git\s+reset\s+--hard\b/, reason: '丢弃 git 工作区改动' },
+      { pattern: /(^|\s)git\s+clean\s+-.*f/, reason: '清理未跟踪文件' },
+      { pattern: /(^|\s)docker\s+(rm|rmi)\b/, reason: '删除容器或镜像' },
+      { pattern: /(^|\s)docker\s+system\s+prune\b/, reason: '批量清理 Docker 资源' },
+      { pattern: /(^|\s)kubectl\s+delete\b/, reason: '删除集群资源' },
+      { pattern: /(^|\s)drop\s+(database|table|schema)\b/, reason: '删除数据库对象' },
+      { pattern: /(^|\s)truncate\s+(table|collection)\b/, reason: '清空数据对象' },
+    ]
+    return patterns.find(entry => entry.pattern.test(normalized))?.reason
+  }
+
+  private isDangerousShellCommand(command: string) {
+    return Boolean(this.getDangerousShellReason(command))
+  }
+
+  private isDangerousToolCall(name: string, input: unknown) {
+    const command = this.getToolCommand(input)
+    if (command && this.isShellLikeTool(name)) {
+      return this.isDangerousShellCommand(command)
+    }
+
+    return false
+  }
+
+  private shouldRequireApproval(name: string, input: unknown, mode: GeneralSettings['toolApprovalMode']) {
+    if (mode === 'all' && !this.isShellLikeTool(name)) {
+      return true
+    }
+
+    if (this.isDangerousToolCall(name, input)) {
+      return true
+    }
+
+    if (mode === 'none') {
+      return false
+    }
+
+    if (this.isShellLikeTool(name)) {
+      return false
+    }
+
+    return this.agent.isToolSensitive(name)
+  }
+
+  private buildApprovalFingerprint(name: string, input: unknown) {
+    const command = this.getToolCommand(input)
+    if (command && this.isShellLikeTool(name)) {
+      return `${name}::command::${command.replace(/\s+/g, ' ').trim()}`
+    }
+
+    return `${name}::input::${this.safeJsonStringify(input)}`
+  }
+
+  private hasRememberedApproval(topicId: string, fingerprint: string) {
+    return this.rememberedApprovals.get(topicId)?.has(fingerprint) ?? false
+  }
+
+  private rememberApproval(topicId: string, fingerprint: string) {
+    const remembered = this.rememberedApprovals.get(topicId) ?? new Set<string>()
+    remembered.add(fingerprint)
+    this.rememberedApprovals.set(topicId, remembered)
+  }
+
+  private buildApprovalEntry(callId: string, name: string, input: unknown, summary: string): ToolProgressEntry {
+    const command = this.getToolCommand(input)
+    const riskReason = command ? this.getDangerousShellReason(command) : undefined
+    return this.createToolProgressEntry(
+      callId,
+      name,
+      input,
+      '等待审批',
+      riskReason ? `风险：高 · ${riskReason}` : '需要你确认后才能继续',
+      summary,
+    )
+  }
+
+  private buildApprovalAiReply(summary: string, question: string, answer: string) {
+    const cleanedAnswer = answer.trim() || 'AI 没有返回额外说明。'
+    const cleanedQuestion = question.trim() || '为什么现在需要执行这个操作？'
+    return [
+      '🧠 临时审批说明',
+      `操作：${summary}`,
+      `问题：${cleanedQuestion}`,
+      cleanedAnswer,
+      '',
+      '_这条说明不会加入上下文，并会自动删除。_',
+    ].join('\n')
+  }
+
+  private async replyEphemeral(interaction: RepliableInteraction, content: string) {
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => {})
+      return
+    }
+
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {})
+  }
+
+  private extractDeniedReason(result: string) {
+    if (result === 'User denied this tool call.') {
+      return ''
+    }
+
+    const prefix = 'User denied this tool call. Reason:'
+    if (!result.startsWith(prefix)) {
+      return undefined
+    }
+
+    return result.slice(prefix.length).trim()
+  }
+
+  private extractGuidance(result: string) {
+    const prefix = 'User denied this tool call. Guidance:'
+    if (!result.startsWith(prefix)) {
+      return undefined
+    }
+
+    return result.slice(prefix.length).trim()
+  }
+
+  private safeJsonStringify(value: unknown) {
+    try {
+      return JSON.stringify(value, null, 2)
+    }
+    catch {
+      return String(value)
+    }
+  }
+
   private getUserFacingErrorMessage(error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
     return message.includes(LLM_RATE_LIMIT_MESSAGE)
@@ -777,18 +1162,143 @@ export class DiscordAdapter {
       .filter(Boolean)
   }
 
-  private async handleInteraction(interaction: import('discord.js').Interaction) {
+  private parseInteractionAction(customId: string) {
+    const separatorIndex = customId.indexOf(':')
+    if (separatorIndex === -1) {
+      return { action: customId, value: '' }
+    }
+
+    return {
+      action: customId.slice(0, separatorIndex),
+      value: customId.slice(separatorIndex + 1),
+    }
+  }
+
+  private async ensureInteractionAllowed(interaction: RepliableInteraction) {
+    if (!this.isAllowedDiscordUser(interaction.user.id)) {
+      await this.replyEphemeral(interaction, '你不在此机器人的允许用户列表中。')
+      return false
+    }
+
+    if (this.instance.discordGuildId && interaction.guildId !== this.instance.discordGuildId) {
+      await this.replyEphemeral(interaction, '此交互只能在已配置的 Discord 服务器中使用。')
+      return false
+    }
+
+    if (!interaction.channelId) {
+      await this.replyEphemeral(interaction, '无法识别当前频道，无法执行此交互。')
+      return false
+    }
+
+    const parentChannelId = interaction.channel?.isThread() ? interaction.channel.parentId : null
+    if (!this.isAllowedDiscordChannel(interaction.channelId, parentChannelId)) {
+      await this.replyEphemeral(interaction, '此交互只能在已配置的频道或其子区中使用。')
+      return false
+    }
+
+    return true
+  }
+
+  private buildApprovalQuestionModal(customId: string, title: string, label: string, placeholder: string, required: boolean) {
+    const input = new TextInputBuilder()
+      .setCustomId('question')
+      .setLabel(label)
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(required)
+      .setMaxLength(500)
+      .setPlaceholder(placeholder)
+
+    return new ModalBuilder()
+      .setCustomId(customId)
+      .setTitle(title)
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input))
+  }
+
+  private async handleInteraction(interaction: Interaction) {
+    if (!interaction.isButton() && !interaction.isModalSubmit() && !interaction.isChatInputCommand()) {
+      return
+    }
+
+    if (!await this.ensureInteractionAllowed(interaction)) {
+      return
+    }
+
     if (interaction.isButton()) {
-      const [action, callId] = interaction.customId.split(':')
-      if ((action === 'tool_approve' || action === 'tool_deny') && callId) {
-        const approval = this.pendingApprovals.get(callId)
-        const approved = action === 'tool_approve'
-        if (approval) {
-          await approval.finish(approved, interaction)
-        }
-        else {
-          await interaction.reply({ content: '此操作已过期。', flags: MessageFlags.Ephemeral }).catch(() => {})
-        }
+      const { action, value: callId } = this.parseInteractionAction(interaction.customId)
+      const approval = callId ? this.pendingApprovals.get(callId) : undefined
+
+      if (!callId || !action.startsWith('tool_')) {
+        return
+      }
+
+      if (!approval) {
+        await this.replyEphemeral(interaction, '此操作已过期。')
+        return
+      }
+
+      if (action === 'tool_approve') {
+        await interaction.deferUpdate().catch(() => {})
+        await approval.finish({ approved: true })
+        return
+      }
+
+      if (action === 'tool_always') {
+        await interaction.deferUpdate().catch(() => {})
+        await approval.remember()
+        return
+      }
+
+      if (action === 'tool_deny') {
+        await interaction.deferUpdate().catch(() => {})
+        await approval.finish({ approved: false })
+        return
+      }
+
+      if (action === 'tool_guide') {
+        await interaction.showModal(this.buildApprovalQuestionModal(
+          `tool_guide_modal:${callId}`,
+          '指导模型',
+          '指导内容',
+          '例如：先 ls 确认目录，再仅删除临时文件，不要直接 rm -rf。',
+          true,
+        )).catch(() => {})
+        return
+      }
+
+      if (action === 'tool_ask_ai') {
+        await interaction.showModal(this.buildApprovalQuestionModal(
+          `tool_ask_ai_modal:${callId}`,
+          '临时问 AI',
+          '你想问什么？',
+          '例如：为什么现在需要执行这一步？如果拒绝会卡在哪里？',
+          false,
+        )).catch(() => {})
+        return
+      }
+    }
+
+    if (interaction.isModalSubmit()) {
+      const { action, value: callId } = this.parseInteractionAction(interaction.customId)
+      const approval = callId ? this.pendingApprovals.get(callId) : undefined
+
+      if (!callId || !action.startsWith('tool_')) {
+        return
+      }
+
+      if (!approval) {
+        await this.replyEphemeral(interaction, '此操作已过期。')
+        return
+      }
+
+      const question = interaction.fields.getTextInputValue('question').trim()
+
+      if (action === 'tool_guide_modal') {
+        await approval.guide(interaction, question)
+        return
+      }
+
+      if (action === 'tool_ask_ai_modal') {
+        await approval.askAI(interaction, question)
         return
       }
     }
@@ -796,31 +1306,6 @@ export class DiscordAdapter {
     if (!interaction.isChatInputCommand()) return
 
     try {
-      if (!this.isAllowedDiscordUser(interaction.user.id)) {
-        await interaction.reply({
-          content: '你不在此机器人的允许用户列表中。',
-          flags: MessageFlags.Ephemeral,
-        })
-        return
-      }
-
-      if (this.instance.discordGuildId && interaction.guildId !== this.instance.discordGuildId) {
-        await interaction.reply({
-          content: '此命令只能在已配置的 Discord 服务器中使用。',
-          flags: MessageFlags.Ephemeral,
-        })
-        return
-      }
-
-      const parentChannelId = interaction.channel?.isThread() ? interaction.channel.parentId : null
-      if (!this.isAllowedDiscordChannel(interaction.channelId, parentChannelId)) {
-        await interaction.reply({
-          content: '此命令只能在已配置的频道或其子区中使用。',
-          flags: MessageFlags.Ephemeral,
-        })
-        return
-      }
-
       if (interaction.commandName === STOP_COMMAND.name) {
         await interaction.reply({
           content: this.formatStopResult(this.stopScopeRequests(this.buildChannelScope(interaction.channelId, interaction.guildId).scopeKey)),
