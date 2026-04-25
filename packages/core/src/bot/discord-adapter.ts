@@ -4,6 +4,7 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
 } from 'discord.js'
 import type { ButtonInteraction, Message, MessageEditOptions, TextBasedChannel } from 'discord.js'
 import type { BotInstanceRow, RoleRow } from '@zakobot/database'
@@ -14,9 +15,13 @@ import { buildAssistantMessageChunks } from './discord-stream-renderer.js'
 import { DiscordModelCommand, MODEL_COMMAND } from './model-command.js'
 
 const TOOL_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+const COMMAND_REGISTRATION_COOLDOWN_MS = 5 * 60 * 1000
 const LLM_RATE_LIMIT_MESSAGE = 'LLM 服务当前过于繁忙，请稍等片刻后重试。'
 const REQUEST_STOPPED_MESSAGE = '请求已停止。'
 const QUEUED_REQUEST_NOTICE = '当前机器人还有其他请求正在处理，已加入队列。可通过 /stop 停止当前频道或话题中的请求。'
+
+const recentCommandRegistrations = new Map<string, number>()
+const pendingCommandRegistrations = new Map<string, Promise<void>>()
 
 type MsgPayload = {
   content: string
@@ -104,6 +109,18 @@ export class DiscordAdapter {
       void this.handleInteraction(interaction).catch((err) => {
         console.error(`[Discord] Unhandled interaction error in "${this.instance.name}":`, err)
       })
+    })
+    this.client.on('shardDisconnect', (_event, shardId) => {
+      console.warn(`[Discord] "${this.instance.name}" shard ${shardId} disconnected.`)
+    })
+    this.client.on('shardReconnecting', (shardId) => {
+      console.warn(`[Discord] "${this.instance.name}" shard ${shardId} reconnecting.`)
+    })
+    this.client.on('shardResume', (replayedEvents, shardId) => {
+      console.log(`[Discord] "${this.instance.name}" shard ${shardId} resumed with ${replayedEvents} replayed events.`)
+    })
+    this.client.on('error', (error) => {
+      console.error(`[Discord] Client error in "${this.instance.name}":`, error)
     })
 
     this.modelCommand = new DiscordModelCommand({
@@ -611,7 +628,7 @@ export class DiscordAdapter {
           await approval.finish(approved, interaction)
         }
         else {
-          await interaction.reply({ content: '此操作已过期。', ephemeral: true }).catch(() => {})
+          await interaction.reply({ content: '此操作已过期。', flags: MessageFlags.Ephemeral }).catch(() => {})
         }
         return
       }
@@ -623,7 +640,7 @@ export class DiscordAdapter {
       if (!this.isAllowedDiscordUser(interaction.user.id)) {
         await interaction.reply({
           content: '你不在此机器人的允许用户列表中。',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         })
         return
       }
@@ -631,7 +648,7 @@ export class DiscordAdapter {
       if (this.instance.discordGuildId && interaction.guildId !== this.instance.discordGuildId) {
         await interaction.reply({
           content: '此命令只能在已配置的 Discord 服务器中使用。',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         })
         return
       }
@@ -640,7 +657,7 @@ export class DiscordAdapter {
       if (!this.isAllowedDiscordChannel(interaction.channelId, parentChannelId)) {
         await interaction.reply({
           content: '此命令只能在已配置的频道或其子区中使用。',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         })
         return
       }
@@ -648,26 +665,26 @@ export class DiscordAdapter {
       if (interaction.commandName === STOP_COMMAND.name) {
         await interaction.reply({
           content: this.formatStopResult(this.stopScopeRequests(this.buildChannelScope(interaction.channelId, interaction.guildId).scopeKey)),
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         })
         return
       }
 
       if (interaction.commandName === MANUAL_BROWSER_COMMAND.name) {
-        await interaction.deferReply({ ephemeral: true })
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral })
         await interaction.editReply(await this.startManualBrowser())
         return
       }
 
       if (interaction.commandName === MODEL_COMMAND.name) {
-        await interaction.deferReply({ ephemeral: true })
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral })
         const index = interaction.options.getInteger('index') ?? undefined
         const replies = typeof index === 'number'
           ? [await this.modelCommand.switchByIndexReply(index)]
           : await this.modelCommand.buildListReply()
         await interaction.editReply(replies[0] ?? '未获取到模型列表。')
         for (const reply of replies.slice(1)) {
-          await interaction.followUp({ content: reply, ephemeral: true })
+          await interaction.followUp({ content: reply, flags: MessageFlags.Ephemeral })
         }
         return
       }
@@ -682,7 +699,7 @@ export class DiscordAdapter {
 
       await interaction.reply({
         content: `已开启新话题：${topic.name}\n子区：<#${thread.id}>`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       })
     } catch (err) {
       console.error(`[Discord] Command error in "${this.instance.name}":`, err)
@@ -701,14 +718,14 @@ export class DiscordAdapter {
       if (interaction.replied) {
         await interaction.followUp({
           content: errorMessage,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         }).catch(() => {})
         return
       }
 
       await interaction.reply({
         content: errorMessage,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       }).catch(() => {})
     }
   }
@@ -717,11 +734,42 @@ export class DiscordAdapter {
     const application = this.client.application
     if (!application) throw new Error('Discord application is not ready')
 
+    const scopeKey = this.instance.discordGuildId
+      ? `guild:${application.id}:${this.instance.discordGuildId}`
+      : `global:${application.id}`
+    const now = Date.now()
+    const lastRegisteredAt = recentCommandRegistrations.get(scopeKey) ?? 0
+    if (now - lastRegisteredAt < COMMAND_REGISTRATION_COOLDOWN_MS) {
+      return
+    }
+
+    const pending = pendingCommandRegistrations.get(scopeKey)
+    if (pending) {
+      await pending
+      return
+    }
+
+    const registration = this.syncCommands(application, scopeKey)
+    pendingCommandRegistrations.set(scopeKey, registration)
+
+    try {
+      await registration
+    }
+    finally {
+      if (pendingCommandRegistrations.get(scopeKey) === registration) {
+        pendingCommandRegistrations.delete(scopeKey)
+      }
+    }
+  }
+
+  private async syncCommands(application: NonNullable<DiscordAdapter['client']['application']>, scopeKey: string) {
+    const definitions = [NEW_TOPIC_COMMAND, STOP_COMMAND, MANUAL_BROWSER_COMMAND, MODEL_COMMAND]
+
     if (this.instance.discordGuildId) {
       const guild = await this.client.guilds.fetch(this.instance.discordGuildId)
       const existing = await guild.commands.fetch()
 
-      for (const definition of [NEW_TOPIC_COMMAND, STOP_COMMAND, MANUAL_BROWSER_COMMAND, MODEL_COMMAND]) {
+      for (const definition of definitions) {
         const command = existing.find(item => item.name === definition.name)
         if (command) {
           await command.edit(definition)
@@ -731,13 +779,14 @@ export class DiscordAdapter {
         }
       }
 
+      recentCommandRegistrations.set(scopeKey, Date.now())
       console.log(`[Discord] Registered /${NEW_TOPIC_COMMAND.name}, /${STOP_COMMAND.name}, /${MANUAL_BROWSER_COMMAND.name}, and /${MODEL_COMMAND.name} for guild ${guild.id}`)
       return
     }
 
     const existing = await application.commands.fetch()
 
-    for (const definition of [NEW_TOPIC_COMMAND, STOP_COMMAND, MANUAL_BROWSER_COMMAND, MODEL_COMMAND]) {
+    for (const definition of definitions) {
       const command = existing.find(item => item.name === definition.name)
       if (command) {
         await command.edit(definition)
@@ -747,6 +796,7 @@ export class DiscordAdapter {
       }
     }
 
+    recentCommandRegistrations.set(scopeKey, Date.now())
     console.log(`[Discord] Registered global /${NEW_TOPIC_COMMAND.name}, /${STOP_COMMAND.name}, /${MANUAL_BROWSER_COMMAND.name}, and /${MODEL_COMMAND.name}`)
   }
 
