@@ -568,7 +568,13 @@ export class DiscordAdapter {
     const pattern = this.pickToolField(payload, ['pattern', 'query', 'text'])
     const value = this.pickToolField(payload, ['value'])
 
-    if (toolName === 'bash' || toolName.endsWith('__bash') || toolName.endsWith('_bash')) {
+    if (
+      toolName === 'bash'
+      || toolName === 'shell_exec'
+      || toolName.includes('shell')
+      || toolName.endsWith('__bash')
+      || toolName.endsWith('_bash')
+    ) {
       return command ? `执行命令 ${this.inlineCode(this.truncateValue(command, 90))}` : '执行命令'
     }
 
